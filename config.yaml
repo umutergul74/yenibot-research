@@ -1,14 +1,14 @@
 project:
-  name: yeniBot
+  name: yenibot-research
   package: yenibot
   phase: 1
   random_seed: 42
   deterministic: true
 
 paths:
-  drive_base: /content/drive/MyDrive/yeniBot
-  data_dir: /content/drive/MyDrive/yeniBot/data
-  checkpoint_dir: /content/drive/MyDrive/yeniBot/checkpoints
+  drive_base: /content/drive/MyDrive/yenibot-research
+  data_dir: /content/drive/MyDrive/yenibot-research/data
+  checkpoint_dir: /content/drive/MyDrive/yenibot-research/checkpoints
   local_data_dir: data
   local_checkpoint_dir: checkpoints
 
