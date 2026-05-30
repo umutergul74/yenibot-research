@@ -1,0 +1,853 @@
+features:
+  profiles:
+    baseline_plus_4h_bounded_whale_no_4h_tier1_no_4h_pure_volatility_no_slow_4h_bounded_flow:
+      description: Stability candidate removing raw 4H pure volatility plus slow 12/24-bar 4H bounded flow.
+      inherit: baseline_plus_4h_bounded_whale_no_4h_tier1_no_4h_pure_volatility
+      append_exclude_patterns:
+        - "4h_taker_imbalance_mean_12"
+        - "4h_taker_imbalance_mean_24"
+    baseline_plus_4h_bounded_whale_no_4h_tier1_no_4h_pure_volatility_no_4h_bounded_flow:
+      description: Stability candidate removing raw 4H pure volatility plus all 4H bounded taker-flow context.
+      inherit: baseline_plus_4h_bounded_whale_no_4h_tier1_no_4h_pure_volatility
+      append_exclude_patterns:
+        - "4h_taker_imbalance"
+        - "4h_taker_buy_ratio_zscore"
+        - "4h_taker_buy_ratio_delta"
+        - "4h_taker_imbalance_slope"
+        - "4h_taker_imbalance_mean_*"
+    baseline_control_plus_futures_context:
+      description: Broad historical futures-context profile from run 20260524_072602; kept for diagnostics only because it improved holdout top-10 but damaged CV stability.
+      inherit: baseline_plus_4h_bounded_whale
+      include_patterns:
+        - "fut_*_stable_rank"
+        - "fut_*_stable_zscore"
+        - "fut_*_stable_tanh"
+        - "fut_metrics_missing"
+        - "fut_funding_missing"
+      exclude_patterns:
+        - "fut_oi_log_return*"
+        - "fut_oi_value_log_return*"
+        - "fut_oi_change_12"
+        - "fut_oi_change_36"
+        - "fut_oi_change_96"
+        - "fut_oi_change_288"
+        - "fut_oi_value_change_12"
+        - "fut_oi_value_change_36"
+        - "fut_oi_value_change_96"
+        - "fut_oi_value_change_288"
+        - "fut_toptrader_count_long_short_log_ratio"
+        - "fut_toptrader_sum_long_short_log_ratio"
+        - "fut_global_long_short_log_ratio"
+        - "fut_taker_long_short_vol_log_ratio"
+        - "fut_funding_rate"
+        - "fut_funding_rate_delta"
+        - "fut_funding_sum_3"
+        - "fut_funding_sum_6"
+        - "fut_funding_sum_12"
+        - "fut_funding_mean_3"
+        - "fut_funding_mean_6"
+        - "fut_funding_mean_12"
+        - "4h_taker_buy_ratio"
+        - "4h_taker_sell_ratio"
+        - "4h_true_cvd_zscore"
+        - "4h_true_cvd_delta_norm"
+        - "4h_cvd_cumulative_rate_norm"
+        - "4h_buy_sell_imbalance_ema"
+        - "*orderflow_efficiency*"
+        - "*absorption_pressure*"
+        - "*cvd_price_divergence*"
+        - "cvd_pressure*"
+        - "4h_cvd_pressure*"
+        - "*large_trade_pressure*"
+        - "log_return_stable_*"
+        - "close_denoised_log_return_stable_*"
+        - "realized_vol_14_stable_*"
+        - "gk_vol_14_stable_*"
+        - "atr_14_pct_stable_*"
+        - "adx_14_stable_*"
+        - "vwap_dist_atr_stable_*"
+        - "volume_log_zscore_stable_*"
+        - "volume_denoised_log_zscore_stable_*"
+        - "4h_log_return_stable_*"
+        - "4h_close_denoised_log_return_stable_*"
+        - "4h_realized_vol_14_stable_*"
+        - "4h_gk_vol_14_stable_*"
+        - "4h_atr_14_pct_stable_*"
+        - "4h_adx_14_stable_*"
+        - "4h_vwap_dist_atr_stable_*"
+        - "4h_volume_log_zscore_stable_*"
+        - "4h_volume_denoised_log_zscore_stable_*"
+        - "4h_realized_vol_14"
+        - "4h_gk_vol_14"
+        - "4h_atr_14_pct"
+        - "realized_vol_14"
+        - "gk_vol_14"
+        - "atr_14_pct"
+    baseline_control_plus_futures_oi_change_context:
+      description: Control baseline plus only Binance Vision open-interest change context; excludes funding and positioning ratios to isolate OI signal stability.
+      inherit: baseline_control_plus_futures_context
+      include_patterns:
+        - "fut_oi_change_*_stable_rank"
+        - "fut_oi_change_*_stable_zscore"
+        - "fut_oi_change_*_stable_tanh"
+        - "fut_oi_value_change_*_stable_rank"
+        - "fut_oi_value_change_*_stable_zscore"
+        - "fut_oi_value_change_*_stable_tanh"
+        - "fut_metrics_missing"
+      exclude_patterns:
+        - "fut_oi_log_return*"
+        - "fut_oi_value_log_return*"
+        - "fut_toptrader_*"
+        - "fut_global_long_short_*"
+        - "fut_taker_long_short_*"
+        - "fut_funding_*"
+        - "4h_taker_buy_ratio"
+        - "4h_taker_sell_ratio"
+        - "4h_true_cvd_zscore"
+        - "4h_true_cvd_delta_norm"
+        - "4h_cvd_cumulative_rate_norm"
+        - "4h_buy_sell_imbalance_ema"
+        - "*orderflow_efficiency*"
+        - "*absorption_pressure*"
+        - "*cvd_price_divergence*"
+        - "cvd_pressure*"
+        - "4h_cvd_pressure*"
+        - "*large_trade_pressure*"
+        - "log_return_stable_*"
+        - "close_denoised_log_return_stable_*"
+        - "realized_vol_14_stable_*"
+        - "gk_vol_14_stable_*"
+        - "atr_14_pct_stable_*"
+        - "adx_14_stable_*"
+        - "vwap_dist_atr_stable_*"
+        - "volume_log_zscore_stable_*"
+        - "volume_denoised_log_zscore_stable_*"
+        - "4h_log_return_stable_*"
+        - "4h_close_denoised_log_return_stable_*"
+        - "4h_realized_vol_14_stable_*"
+        - "4h_gk_vol_14_stable_*"
+        - "4h_atr_14_pct_stable_*"
+        - "4h_adx_14_stable_*"
+        - "4h_vwap_dist_atr_stable_*"
+        - "4h_volume_log_zscore_stable_*"
+        - "4h_volume_denoised_log_zscore_stable_*"
+        - "4h_realized_vol_14"
+        - "4h_gk_vol_14"
+        - "4h_atr_14_pct"
+        - "realized_vol_14"
+        - "gk_vol_14"
+        - "atr_14_pct"
+    baseline_control_plus_futures_positioning_context:
+      description: Control baseline plus only Binance Vision long/short positioning ratios; isolates trader/taker positioning from OI and funding.
+      inherit: baseline_control_plus_futures_context
+      include_patterns:
+        - "fut_toptrader_*_stable_rank"
+        - "fut_toptrader_*_stable_zscore"
+        - "fut_toptrader_*_stable_tanh"
+        - "fut_global_long_short_log_ratio_stable_rank"
+        - "fut_global_long_short_log_ratio_stable_zscore"
+        - "fut_global_long_short_log_ratio_stable_tanh"
+        - "fut_taker_long_short_vol_log_ratio_stable_rank"
+        - "fut_taker_long_short_vol_log_ratio_stable_zscore"
+        - "fut_taker_long_short_vol_log_ratio_stable_tanh"
+        - "fut_metrics_missing"
+      exclude_patterns:
+        - "fut_oi_*"
+        - "fut_funding_*"
+        - "4h_taker_buy_ratio"
+        - "4h_taker_sell_ratio"
+        - "4h_true_cvd_zscore"
+        - "4h_true_cvd_delta_norm"
+        - "4h_cvd_cumulative_rate_norm"
+        - "4h_buy_sell_imbalance_ema"
+        - "*orderflow_efficiency*"
+        - "*absorption_pressure*"
+        - "*cvd_price_divergence*"
+        - "cvd_pressure*"
+        - "4h_cvd_pressure*"
+        - "*large_trade_pressure*"
+        - "log_return_stable_*"
+        - "close_denoised_log_return_stable_*"
+        - "realized_vol_14_stable_*"
+        - "gk_vol_14_stable_*"
+        - "atr_14_pct_stable_*"
+        - "adx_14_stable_*"
+        - "vwap_dist_atr_stable_*"
+        - "volume_log_zscore_stable_*"
+        - "volume_denoised_log_zscore_stable_*"
+        - "4h_log_return_stable_*"
+        - "4h_close_denoised_log_return_stable_*"
+        - "4h_realized_vol_14_stable_*"
+        - "4h_gk_vol_14_stable_*"
+        - "4h_atr_14_pct_stable_*"
+        - "4h_adx_14_stable_*"
+        - "4h_vwap_dist_atr_stable_*"
+        - "4h_volume_log_zscore_stable_*"
+        - "4h_volume_denoised_log_zscore_stable_*"
+        - "4h_realized_vol_14"
+        - "4h_gk_vol_14"
+        - "4h_atr_14_pct"
+        - "realized_vol_14"
+        - "gk_vol_14"
+        - "atr_14_pct"
+    baseline_control_plus_futures_funding_context:
+      description: Control baseline plus only stable funding-rate context; should be skipped automatically if REST funding history is unavailable.
+      inherit: baseline_control_plus_futures_context
+      include_patterns:
+        - "fut_funding_*_stable_rank"
+        - "fut_funding_*_stable_zscore"
+        - "fut_funding_*_stable_tanh"
+        - "fut_funding_missing"
+      exclude_patterns:
+        - "fut_oi_*"
+        - "fut_metrics_missing"
+        - "fut_toptrader_*"
+        - "fut_global_long_short_*"
+        - "fut_taker_long_short_*"
+        - "4h_taker_buy_ratio"
+        - "4h_taker_sell_ratio"
+        - "4h_true_cvd_zscore"
+        - "4h_true_cvd_delta_norm"
+        - "4h_cvd_cumulative_rate_norm"
+        - "4h_buy_sell_imbalance_ema"
+        - "*orderflow_efficiency*"
+        - "*absorption_pressure*"
+        - "*cvd_price_divergence*"
+        - "cvd_pressure*"
+        - "4h_cvd_pressure*"
+        - "*large_trade_pressure*"
+        - "log_return_stable_*"
+        - "close_denoised_log_return_stable_*"
+        - "realized_vol_14_stable_*"
+        - "gk_vol_14_stable_*"
+        - "atr_14_pct_stable_*"
+        - "adx_14_stable_*"
+        - "vwap_dist_atr_stable_*"
+        - "volume_log_zscore_stable_*"
+        - "volume_denoised_log_zscore_stable_*"
+        - "4h_log_return_stable_*"
+        - "4h_close_denoised_log_return_stable_*"
+        - "4h_realized_vol_14_stable_*"
+        - "4h_gk_vol_14_stable_*"
+        - "4h_atr_14_pct_stable_*"
+        - "4h_adx_14_stable_*"
+        - "4h_vwap_dist_atr_stable_*"
+        - "4h_volume_log_zscore_stable_*"
+        - "4h_volume_denoised_log_zscore_stable_*"
+        - "4h_realized_vol_14"
+        - "4h_gk_vol_14"
+        - "4h_atr_14_pct"
+        - "realized_vol_14"
+        - "gk_vol_14"
+        - "atr_14_pct"
+    baseline_stable_no_1h_cvd_rate:
+      description: Stability control without the local CVD cumulative-rate feature that repeatedly reverses in bad folds.
+      inherit: baseline_plus_4h_bounded_whale_no_4h_tier1_no_4h_pure_volatility_no_1h_pure_volatility
+      append_exclude_patterns:
+        - "cvd_cumulative_rate_norm"
+    baseline_stable_no_slow_4h_bounded_flow:
+      description: Stability control without slow 12/24-bar aligned 4H taker-imbalance means, keeping faster bounded flow context.
+      inherit: baseline_plus_4h_bounded_whale_no_4h_tier1_no_4h_pure_volatility_no_1h_pure_volatility
+      append_exclude_patterns:
+        - "4h_taker_imbalance_mean_12"
+        - "4h_taker_imbalance_mean_24"
+    baseline_stable_no_4h_taker_mean12:
+      description: "Feature-drift forensic candidate: remove only the 12-bar aligned 4H taker-imbalance mean that showed bad-fold signal reversal; keep 24-bar context to avoid repeating the rejected broad slow-flow ablation."
+      inherit: baseline_plus_4h_bounded_whale_no_4h_tier1_no_4h_pure_volatility_no_1h_pure_volatility
+      append_exclude_patterns:
+        - "4h_taker_imbalance_mean_12"
+    baseline_stable_no_4h_large_trade_ratio:
+      description: "Feature-drift forensic candidate: remove only raw aligned 4H large_trade_ratio after bad-fold distribution drift; keep 4H VPT z-score, volume-per-trade z-score, and sparse whale flags."
+      inherit: baseline_plus_4h_bounded_whale_no_4h_tier1_no_4h_pure_volatility_no_1h_pure_volatility
+      append_exclude_patterns:
+        - "4h_large_trade_ratio"
+    baseline_stable_no_4h_taker_mean12_no_4h_large_trade_ratio:
+      description: "Combined forensic candidate removing the two current bad-fold suspects: 4H taker-imbalance mean 12 and raw 4H large-trade ratio; keep slower 24-bar flow and other whale context."
+      inherit: baseline_stable_no_4h_taker_mean12
+      append_exclude_patterns:
+        - "4h_large_trade_ratio"
+    baseline_stable_plus_4h_taker_mean12_ltr_context:
+      description: "Targeted conditional context profile from run 20260526_185416: keep the control backbone and add only stable 4H taker-mean12 / large-trade-ratio context plus their narrow conditional interactions."
+      inherit: baseline_stable_allow_intrahour_stable
+      include_patterns:
+        - "4h_taker_imbalance_mean_12_stable_rank"
+        - "4h_large_trade_ratio_stable_rank"
+        - "4h_taker_mean12_x_ltr_rank_signed"
+        - "4h_taker_mean12_x_ltr_rank_high"
+        - "4h_taker_mean12_x_ltr_rank_low"
+    baseline_stable_plus_4h_taker_mean12_ltr_context_no_raw_ltr:
+      description: "Conditional context profile that removes raw 4H large_trade_ratio while preserving stable large-trade context and conditional taker-flow interactions."
+      inherit: baseline_stable_plus_4h_taker_mean12_ltr_context
+      append_exclude_patterns:
+        - "4h_large_trade_ratio"
+    baseline_stable_plus_4h_taker_mean12_ltr_context_stable_only:
+      description: "Most conservative conditional context profile: replace raw 4H taker_mean12 and raw 4H large_trade_ratio with stable context and narrow conditional interactions."
+      inherit: baseline_stable_plus_4h_taker_mean12_ltr_context
+      append_exclude_patterns:
+        - "4h_taker_imbalance_mean_12"
+        - "4h_large_trade_ratio"
+    baseline_stable_no_slow_4h_bounded_flow_no_1h_cvd_rate:
+      description: "Stability control with the two most plausible bad-fold stabilizers combined: no slow 4H flow means and no local CVD rate."
+      inherit: baseline_stable_no_slow_4h_bounded_flow
+      append_exclude_patterns:
+        - "cvd_cumulative_rate_norm"
+    baseline_stable_no_4h_whale_zscores:
+      description: Stability control without smoother 4H whale z-score magnitudes, retaining sparse whale flags and large-trade ratio.
+      inherit: baseline_plus_4h_bounded_whale_no_4h_tier1_no_4h_pure_volatility_no_1h_pure_volatility
+      append_exclude_patterns:
+        - "4h_vpt_zscore"
+        - "4h_vol_per_trade_log_zscore"
+    baseline_stable_no_4h_volume_context:
+      description: Stability control without aligned 4H volume context; tests whether 4H volume level features are adding regime noise.
+      inherit: baseline_plus_4h_bounded_whale_no_4h_tier1_no_4h_pure_volatility_no_1h_pure_volatility
+      append_exclude_patterns:
+        - "4h_volume_log_zscore"
+        - "4h_volume_denoised_log_zscore"
+    baseline_stable_no_1h_large_trade_ratio:
+      description: Stability control without local large-trade-ratio smoothing, isolating whether sparse whale flags carry the cleaner signal.
+      inherit: baseline_plus_4h_bounded_whale_no_4h_tier1_no_4h_pure_volatility_no_1h_pure_volatility
+      append_exclude_patterns:
+        - "large_trade_ratio"
+    baseline_stable_plus_15m_late_order_flow:
+      description: Stability control plus only late-hour 15m taker-flow shape features.
+      inherit: baseline_stable_allow_intrahour_stable
+      include_patterns:
+        - "ih15_coverage"
+        - "ih15_taker_imbalance_last"
+        - "ih15_taker_imbalance_late_minus_early"
+        - "ih15_taker_imbalance_slope"
+        - "ih15_buy_ratio_range"
+        - "ih15_volume_share_last"
+        - "ih15_aggressive_buy_burst"
+        - "ih15_aggressive_sell_burst"
+        - "ih15_aggressive_buy_burst_stable_rank"
+        - "ih15_aggressive_sell_burst_stable_rank"
+    baseline_stable_plus_15m_intrahour_pressure:
+      description: Stability control plus 15m intrahour CVD pressure and normalized pressure-shape features.
+      inherit: baseline_stable_allow_intrahour_stable
+      include_patterns:
+        - "ih15_cvd_pressure_norm"
+        - "ih15_cvd_pressure_late_minus_early_norm"
+        - "ih15_cvd_slope_norm"
+        - "ih15_cvd_pressure_norm_stable_rank"
+        - "ih15_cvd_pressure_norm_stable_zscore"
+        - "ih15_cvd_slope_norm_stable_rank"
+        - "ih15_cvd_slope_norm_stable_zscore"
+        - "ih15_taker_imbalance_late_minus_early"
+        - "ih15_taker_imbalance_slope"
+    baseline_stable_plus_15m_whale_burst:
+      description: Stability control plus 15m ticket-size burst and last-quarter aggressive flow concentration.
+      inherit: baseline_stable_allow_intrahour_stable
+      include_patterns:
+        - "ih15_volume_share_last"
+        - "ih15_trade_share_last"
+        - "ih15_vpt_last_vs_hour"
+        - "ih15_vpt_late_vs_early"
+        - "ih15_large_trade_concentration"
+        - "ih15_buy_volume_share_last"
+        - "ih15_vpt_last_vs_hour_stable_rank"
+        - "ih15_vpt_last_vs_hour_stable_zscore"
+        - "ih15_large_trade_concentration_stable_rank"
+        - "ih15_large_trade_concentration_stable_zscore"
+        - "ih15_aggressive_buy_burst"
+        - "ih15_aggressive_sell_burst"
+    baseline_stable_plus_15m_order_flow_full:
+      description: Stability control plus the full bounded 15m intrahour order-flow shape family.
+      inherit: baseline_stable_allow_intrahour_stable
+      include_patterns:
+        - "ih15_*"
+    baseline_stable_plus_15m_absorption_rank:
+      description: Stability control plus 15m buy/sell absorption ranks, avoiding raw CVD pressure features that failed in 20260513_123606.
+      inherit: baseline_stable_allow_intrahour_stable
+      include_patterns:
+        - "ih15_missing"
+        - "ih15_coverage"
+        - "ih15_buy_absorption_stable_rank"
+        - "ih15_sell_absorption_stable_rank"
+        - "ih15_absorption_imbalance_stable_rank"
+        - "ih15_late_buy_absorption_stable_rank"
+        - "ih15_late_sell_absorption_stable_rank"
+        - "ih15_late_absorption_imbalance_stable_rank"
+    baseline_stable_plus_15m_late_reversal_tanh:
+      description: Stability control plus late-hour reversal pressure features, focused on intrahour flow/price turns rather than raw pressure.
+      inherit: baseline_stable_allow_intrahour_stable
+      include_patterns:
+        - "ih15_missing"
+        - "ih15_coverage"
+        - "ih15_late_flow_reversal_stable_rank"
+        - "ih15_late_flow_reversal_stable_tanh"
+        - "ih15_late_price_reversal_stable_rank"
+        - "ih15_late_price_reversal_stable_tanh"
+        - "ih15_late_flow_price_alignment_stable_rank"
+        - "ih15_late_flow_price_alignment_stable_tanh"
+    baseline_stable_plus_15m_absorption_efficiency_combo:
+      description: Stability control plus a compact 15m absorption and flow-efficiency combo, capped to a small feature count.
+      inherit: baseline_stable_allow_intrahour_stable
+      include_patterns:
+        - "ih15_missing"
+        - "ih15_coverage"
+        - "ih15_absorption_imbalance_stable_rank"
+        - "ih15_absorption_imbalance_stable_tanh"
+        - "ih15_late_absorption_imbalance_stable_rank"
+        - "ih15_late_absorption_imbalance_stable_tanh"
+        - "ih15_flow_price_alignment_stable_rank"
+        - "ih15_flow_price_alignment_stable_tanh"
+        - "ih15_late_flow_price_alignment_stable_rank"
+        - "ih15_late_flow_price_alignment_stable_tanh"
+    baseline_plus_4h_bounded_whale_no_4h_tier1_no_raw_pure_volatility_except_1h_atr:
+      description: "Minimum volatility re-add: stability branch plus only local 1H ATR percent."
+      inherit: baseline_plus_4h_bounded_whale_no_4h_tier1
+      append_exclude_patterns:
+        - "4h_realized_vol_14"
+        - "4h_gk_vol_14"
+        - "4h_atr_14_pct"
+        - "realized_vol_14"
+        - "gk_vol_14"
+    baseline_plus_4h_bounded_whale_no_4h_tier1_no_raw_pure_volatility_except_1h_gk:
+      description: "Minimum volatility re-add: stability branch plus only local 1H Garman-Klass volatility."
+      inherit: baseline_plus_4h_bounded_whale_no_4h_tier1
+      append_exclude_patterns:
+        - "4h_realized_vol_14"
+        - "4h_gk_vol_14"
+        - "4h_atr_14_pct"
+        - "realized_vol_14"
+        - "atr_14_pct"
+    baseline_plus_4h_bounded_whale_no_4h_tier1_no_raw_pure_volatility_except_1h_realized:
+      description: "Minimum volatility re-add: stability branch plus only local 1H realized volatility."
+      inherit: baseline_plus_4h_bounded_whale_no_4h_tier1
+      append_exclude_patterns:
+        - "4h_realized_vol_14"
+        - "4h_gk_vol_14"
+        - "4h_atr_14_pct"
+        - "gk_vol_14"
+        - "atr_14_pct"
+    baseline_plus_4h_bounded_whale_no_4h_tier1_no_raw_pure_volatility_except_4h_atr:
+      description: "Minimum volatility re-add: stability branch plus only aligned 4H ATR percent."
+      inherit: baseline_plus_4h_bounded_whale_no_4h_tier1
+      append_exclude_patterns:
+        - "4h_realized_vol_14"
+        - "4h_gk_vol_14"
+        - "realized_vol_14"
+        - "gk_vol_14"
+        - "atr_14_pct"
+    baseline_plus_4h_bounded_whale_no_4h_tier1_no_raw_pure_volatility_except_4h_gk:
+      description: "Minimum volatility re-add: stability branch plus only aligned 4H Garman-Klass volatility."
+      inherit: baseline_plus_4h_bounded_whale_no_4h_tier1
+      append_exclude_patterns:
+        - "4h_realized_vol_14"
+        - "4h_atr_14_pct"
+        - "realized_vol_14"
+        - "gk_vol_14"
+        - "atr_14_pct"
+    baseline_plus_4h_bounded_whale_no_4h_tier1_no_raw_pure_volatility_except_4h_realized:
+      description: "Minimum volatility re-add: stability branch plus only aligned 4H realized volatility."
+      inherit: baseline_plus_4h_bounded_whale_no_4h_tier1
+      append_exclude_patterns:
+        - "4h_gk_vol_14"
+        - "4h_atr_14_pct"
+        - "realized_vol_14"
+        - "gk_vol_14"
+        - "atr_14_pct"
+    baseline_plus_4h_bounded_whale_no_4h_tier1_no_4h_1h_pure_volatility_plus_4h_stable_vol_overlay:
+      description: Latest stability branch with raw 1H/4H pure volatility removed, then only narrow 4H stable volatility/structure overlay added back.
+      inherit: baseline_plus_4h_bounded_whale_no_4h_tier1_plus_4h_stable_overlay
+      append_exclude_patterns:
+        - "4h_realized_vol_14"
+        - "4h_gk_vol_14"
+        - "4h_atr_14_pct"
+        - "realized_vol_14"
+        - "gk_vol_14"
+        - "atr_14_pct"
+    baseline_plus_4h_bounded_whale_no_4h_tier1_no_4h_pure_volatility_no_4h_volume_context:
+      description: Stability candidate removing raw 4H pure volatility and 4H volume-scale context flagged in bad folds.
+      inherit: baseline_plus_4h_bounded_whale_no_4h_tier1_no_4h_pure_volatility
+      append_exclude_patterns:
+        - "4h_volume_log_zscore"
+        - "4h_volume_denoised_log_zscore"
+    baseline_plus_4h_bounded_whale_stable_structure:
+      description: Long-horizon profile; use stable volatility/structure ranks/zscores instead of raw vol/structure levels.
+      inherit: baseline_plus_4h_bounded_whale_no_4h_tier1
+      include_patterns:
+        - "*log_return_stable_zscore"
+        - "*log_return_stable_rank"
+        - "*realized_vol_14_stable_zscore"
+        - "*realized_vol_14_stable_rank"
+        - "*gk_vol_14_stable_zscore"
+        - "*gk_vol_14_stable_rank"
+        - "*atr_14_pct_stable_zscore"
+        - "*atr_14_pct_stable_rank"
+        - "*adx_14_stable_zscore"
+        - "*adx_14_stable_rank"
+        - "*vwap_dist_atr_stable_zscore"
+        - "*vwap_dist_atr_stable_rank"
+        - "*volume_log_zscore_stable_zscore"
+        - "*volume_log_zscore_stable_rank"
+        - "*volume_denoised_log_zscore_stable_zscore"
+        - "*volume_denoised_log_zscore_stable_rank"
+      exclude_patterns:
+        - "4h_taker_buy_ratio"
+        - "4h_taker_sell_ratio"
+        - "4h_true_cvd_zscore"
+        - "4h_true_cvd_delta_norm"
+        - "4h_cvd_cumulative_rate_norm"
+        - "4h_buy_sell_imbalance_ema"
+        - "*orderflow_efficiency*"
+        - "*absorption_pressure*"
+        - "*cvd_price_divergence*"
+        - "*cvd_pressure*"
+        - "*large_trade_pressure*"
+        - "*log_return"
+        - "*realized_vol_14"
+        - "*gk_vol_14"
+        - "*atr_14_pct"
+        - "*adx_14"
+        - "*vwap_dist_atr"
+        - "*volume_log_zscore"
+        - "*volume_denoised_log_zscore"
+    baseline_plus_4h_bounded_whale_no_4h_tier1_plus_4h_stable_overlay:
+      description: Keep the stronger raw baseline structure backbone and add only a narrow 4H stable-structure overlay.
+      inherit: baseline_plus_4h_bounded_whale_no_4h_tier1
+      include_patterns:
+        - "4h_realized_vol_14_stable_zscore"
+        - "4h_realized_vol_14_stable_rank"
+        - "4h_gk_vol_14_stable_zscore"
+        - "4h_gk_vol_14_stable_rank"
+        - "4h_atr_14_pct_stable_zscore"
+        - "4h_atr_14_pct_stable_rank"
+        - "4h_adx_14_stable_zscore"
+        - "4h_adx_14_stable_rank"
+        - "4h_vwap_dist_atr_stable_zscore"
+        - "4h_vwap_dist_atr_stable_rank"
+      exclude_patterns:
+        - "4h_taker_buy_ratio"
+        - "4h_taker_sell_ratio"
+        - "4h_true_cvd_zscore"
+        - "4h_true_cvd_delta_norm"
+        - "4h_cvd_cumulative_rate_norm"
+        - "4h_buy_sell_imbalance_ema"
+        - "*orderflow_efficiency*"
+        - "*absorption_pressure*"
+        - "*cvd_price_divergence*"
+        - "*cvd_pressure*"
+        - "*large_trade_pressure*"
+        - "log_return_stable_*"
+        - "close_denoised_log_return_stable_*"
+        - "realized_vol_14_stable_*"
+        - "gk_vol_14_stable_*"
+        - "atr_14_pct_stable_*"
+        - "adx_14_stable_*"
+        - "vwap_dist_atr_stable_*"
+        - "volume_log_zscore_stable_*"
+        - "volume_denoised_log_zscore_stable_*"
+        - "4h_log_return_stable_*"
+        - "4h_close_denoised_log_return_stable_*"
+        - "4h_volume_log_zscore_stable_*"
+        - "4h_volume_denoised_log_zscore_stable_*"
+    baseline_no_4h_tier1_pruned_whale:
+      description: Baseline control with noisy 4H large-trade ratio removed while keeping bounded 4H whale context.
+      inherit: baseline_plus_4h_bounded_whale_no_4h_tier1
+      include_patterns: []
+      exclude_patterns:
+        - "4h_taker_buy_ratio"
+        - "4h_taker_sell_ratio"
+        - "4h_true_cvd_zscore"
+        - "4h_true_cvd_delta_norm"
+        - "4h_cvd_cumulative_rate_norm"
+        - "4h_buy_sell_imbalance_ema"
+        - "4h_large_trade_ratio"
+        - "*orderflow_efficiency*"
+        - "*absorption_pressure*"
+        - "*cvd_price_divergence*"
+        - "*cvd_pressure*"
+        - "*large_trade_pressure*"
+        - "*_stable_*"
+    baseline_no_4h_tier1_4h_cvd_pressure_stable:
+      description: Baseline control plus stable 4H CVD pressure windows only.
+      inherit: baseline_plus_4h_bounded_whale_no_4h_tier1
+      include_patterns:
+        - "4h_cvd_pressure_3_stable_zscore"
+        - "4h_cvd_pressure_3_stable_rank"
+        - "4h_cvd_pressure_6_stable_zscore"
+        - "4h_cvd_pressure_6_stable_rank"
+        - "4h_cvd_pressure_12_stable_zscore"
+        - "4h_cvd_pressure_12_stable_rank"
+        - "4h_cvd_pressure_24_stable_zscore"
+        - "4h_cvd_pressure_24_stable_rank"
+      exclude_patterns:
+        - "4h_taker_buy_ratio"
+        - "4h_taker_sell_ratio"
+        - "4h_true_cvd_zscore"
+        - "4h_true_cvd_delta_norm"
+        - "4h_cvd_cumulative_rate_norm"
+        - "4h_buy_sell_imbalance_ema"
+        - "*orderflow_efficiency*"
+        - "*absorption_pressure*"
+        - "*cvd_price_divergence*"
+        - "*large_trade_pressure*"
+        - "log_return_stable_*"
+        - "close_denoised_log_return_stable_*"
+        - "realized_vol_14_stable_*"
+        - "gk_vol_14_stable_*"
+        - "atr_14_pct_stable_*"
+        - "adx_14_stable_*"
+        - "vwap_dist_atr_stable_*"
+        - "volume_log_zscore_stable_*"
+        - "volume_denoised_log_zscore_stable_*"
+        - "4h_log_return_stable_*"
+        - "4h_close_denoised_log_return_stable_*"
+        - "4h_realized_vol_14_stable_*"
+        - "4h_gk_vol_14_stable_*"
+        - "4h_atr_14_pct_stable_*"
+        - "4h_adx_14_stable_*"
+        - "4h_vwap_dist_atr_stable_*"
+        - "4h_volume_log_zscore_stable_*"
+        - "4h_volume_denoised_log_zscore_stable_*"
+    baseline_no_4h_tier1_4h_large_trade_pressure_rank_only:
+      description: Stable 4H large-trade pressure rank-only overlay; tests whether bounded ordering is more robust than z-scores.
+      inherit: baseline_plus_4h_bounded_whale_no_4h_tier1
+      include_patterns:
+        - "4h_signed_large_trade_pressure_stable_rank"
+        - "4h_large_trade_pressure_3_stable_rank"
+        - "4h_large_trade_pressure_6_stable_rank"
+        - "4h_large_trade_pressure_12_stable_rank"
+        - "4h_large_trade_pressure_24_stable_rank"
+      exclude_patterns:
+        - "4h_taker_buy_ratio"
+        - "4h_taker_sell_ratio"
+        - "4h_true_cvd_zscore"
+        - "4h_true_cvd_delta_norm"
+        - "4h_cvd_cumulative_rate_norm"
+        - "4h_buy_sell_imbalance_ema"
+        - "*orderflow_efficiency*"
+        - "*absorption_pressure*"
+        - "*cvd_price_divergence*"
+        - "*cvd_pressure*"
+        - "log_return_stable_*"
+        - "close_denoised_log_return_stable_*"
+        - "realized_vol_14_stable_*"
+        - "gk_vol_14_stable_*"
+        - "atr_14_pct_stable_*"
+        - "adx_14_stable_*"
+        - "vwap_dist_atr_stable_*"
+        - "volume_log_zscore_stable_*"
+        - "volume_denoised_log_zscore_stable_*"
+        - "4h_log_return_stable_*"
+        - "4h_close_denoised_log_return_stable_*"
+        - "4h_realized_vol_14_stable_*"
+        - "4h_gk_vol_14_stable_*"
+        - "4h_atr_14_pct_stable_*"
+        - "4h_adx_14_stable_*"
+        - "4h_vwap_dist_atr_stable_*"
+        - "4h_volume_log_zscore_stable_*"
+        - "4h_volume_denoised_log_zscore_stable_*"
+    baseline_no_4h_tier1_4h_large_trade_pressure_zscore_only:
+      description: Stable 4H large-trade pressure z-score-only overlay; isolates magnitude shocks from rank ordering.
+      inherit: baseline_plus_4h_bounded_whale_no_4h_tier1
+      include_patterns:
+        - "4h_signed_large_trade_pressure_stable_zscore"
+        - "4h_large_trade_pressure_3_stable_zscore"
+        - "4h_large_trade_pressure_6_stable_zscore"
+        - "4h_large_trade_pressure_12_stable_zscore"
+        - "4h_large_trade_pressure_24_stable_zscore"
+      exclude_patterns:
+        - "4h_taker_buy_ratio"
+        - "4h_taker_sell_ratio"
+        - "4h_true_cvd_zscore"
+        - "4h_true_cvd_delta_norm"
+        - "4h_cvd_cumulative_rate_norm"
+        - "4h_buy_sell_imbalance_ema"
+        - "*orderflow_efficiency*"
+        - "*absorption_pressure*"
+        - "*cvd_price_divergence*"
+        - "*cvd_pressure*"
+        - "log_return_stable_*"
+        - "close_denoised_log_return_stable_*"
+        - "realized_vol_14_stable_*"
+        - "gk_vol_14_stable_*"
+        - "atr_14_pct_stable_*"
+        - "adx_14_stable_*"
+        - "vwap_dist_atr_stable_*"
+        - "volume_log_zscore_stable_*"
+        - "volume_denoised_log_zscore_stable_*"
+        - "4h_log_return_stable_*"
+        - "4h_close_denoised_log_return_stable_*"
+        - "4h_realized_vol_14_stable_*"
+        - "4h_gk_vol_14_stable_*"
+        - "4h_atr_14_pct_stable_*"
+        - "4h_adx_14_stable_*"
+        - "4h_vwap_dist_atr_stable_*"
+        - "4h_volume_log_zscore_stable_*"
+        - "4h_volume_denoised_log_zscore_stable_*"
+    baseline_no_4h_tier1_4h_large_trade_pressure_short:
+      description: Stable 4H large-trade pressure short-horizon overlay using 3/6-bar pressure plus signed pressure.
+      inherit: baseline_plus_4h_bounded_whale_no_4h_tier1
+      include_patterns:
+        - "4h_signed_large_trade_pressure_stable_zscore"
+        - "4h_signed_large_trade_pressure_stable_rank"
+        - "4h_large_trade_pressure_3_stable_zscore"
+        - "4h_large_trade_pressure_3_stable_rank"
+        - "4h_large_trade_pressure_6_stable_zscore"
+        - "4h_large_trade_pressure_6_stable_rank"
+      exclude_patterns:
+        - "4h_taker_buy_ratio"
+        - "4h_taker_sell_ratio"
+        - "4h_true_cvd_zscore"
+        - "4h_true_cvd_delta_norm"
+        - "4h_cvd_cumulative_rate_norm"
+        - "4h_buy_sell_imbalance_ema"
+        - "*orderflow_efficiency*"
+        - "*absorption_pressure*"
+        - "*cvd_price_divergence*"
+        - "*cvd_pressure*"
+        - "log_return_stable_*"
+        - "close_denoised_log_return_stable_*"
+        - "realized_vol_14_stable_*"
+        - "gk_vol_14_stable_*"
+        - "atr_14_pct_stable_*"
+        - "adx_14_stable_*"
+        - "vwap_dist_atr_stable_*"
+        - "volume_log_zscore_stable_*"
+        - "volume_denoised_log_zscore_stable_*"
+        - "4h_log_return_stable_*"
+        - "4h_close_denoised_log_return_stable_*"
+        - "4h_realized_vol_14_stable_*"
+        - "4h_gk_vol_14_stable_*"
+        - "4h_atr_14_pct_stable_*"
+        - "4h_adx_14_stable_*"
+        - "4h_vwap_dist_atr_stable_*"
+        - "4h_volume_log_zscore_stable_*"
+        - "4h_volume_denoised_log_zscore_stable_*"
+    baseline_no_4h_tier1_4h_large_trade_pressure_long_no_4h_1h_pure_volatility:
+      description: "Large-trade pressure branch plus the latest stability lesson: remove raw 4H and 1H pure volatility magnitude levels."
+      inherit: baseline_no_4h_tier1_4h_large_trade_pressure_long_no_4h_pure_volatility
+      append_exclude_patterns:
+        - "realized_vol_14"
+        - "gk_vol_14"
+        - "atr_14_pct"
+    baseline_no_4h_tier1_4h_large_trade_pressure_long_no_4h_bounded_flow:
+      description: Champion profile without 4H bounded taker-flow features, keeping 4H whale, structure, and long-horizon pressure overlays.
+      inherit: baseline_no_4h_tier1_4h_large_trade_pressure_long
+      append_exclude_patterns:
+        - "4h_taker_imbalance"
+        - "4h_taker_buy_ratio_zscore"
+        - "4h_taker_buy_ratio_delta"
+        - "4h_taker_imbalance_slope"
+        - "4h_taker_imbalance_mean_*"
+    baseline_no_4h_tier1_4h_large_trade_pressure_long_no_4h_1h_pure_volatility_pressure_24_only:
+      description: "Stability-first pressure branch: remove raw 1H/4H pure volatility and keep only the slower 24-bar 4H pressure pair."
+      inherit: baseline_no_4h_tier1_4h_large_trade_pressure_long_no_4h_pure_volatility_pressure_24_only
+      append_exclude_patterns:
+        - "realized_vol_14"
+        - "gk_vol_14"
+        - "atr_14_pct"
+    baseline_no_4h_tier1_4h_large_trade_pressure_long_bad_fold_guardrail_light:
+      description: Aggressive bad-fold stabilizer removing slow 4H bounded flow, 12-bar 4H pressure, raw 4H pure volatility, and 1H CVD rate.
+      inherit: baseline_no_4h_tier1_4h_large_trade_pressure_long_no_4h_pure_volatility_pressure_24_only
+      append_exclude_patterns:
+        - "4h_taker_imbalance_mean_12"
+        - "4h_taker_imbalance_mean_24"
+        - "cvd_cumulative_rate_norm"
+    baseline_no_4h_tier1_flow_stable_combo:
+      description: Baseline control plus stable 4H CVD pressure and large-trade pressure families.
+      inherit: baseline_plus_4h_bounded_whale_no_4h_tier1
+      include_patterns:
+        - "4h_cvd_pressure_3_stable_zscore"
+        - "4h_cvd_pressure_3_stable_rank"
+        - "4h_cvd_pressure_6_stable_zscore"
+        - "4h_cvd_pressure_6_stable_rank"
+        - "4h_cvd_pressure_12_stable_zscore"
+        - "4h_cvd_pressure_12_stable_rank"
+        - "4h_cvd_pressure_24_stable_zscore"
+        - "4h_cvd_pressure_24_stable_rank"
+        - "4h_signed_large_trade_pressure_stable_zscore"
+        - "4h_signed_large_trade_pressure_stable_rank"
+        - "4h_large_trade_pressure_3_stable_zscore"
+        - "4h_large_trade_pressure_3_stable_rank"
+        - "4h_large_trade_pressure_6_stable_zscore"
+        - "4h_large_trade_pressure_6_stable_rank"
+        - "4h_large_trade_pressure_12_stable_zscore"
+        - "4h_large_trade_pressure_12_stable_rank"
+        - "4h_large_trade_pressure_24_stable_zscore"
+        - "4h_large_trade_pressure_24_stable_rank"
+      exclude_patterns:
+        - "4h_taker_buy_ratio"
+        - "4h_taker_sell_ratio"
+        - "4h_true_cvd_zscore"
+        - "4h_true_cvd_delta_norm"
+        - "4h_cvd_cumulative_rate_norm"
+        - "4h_buy_sell_imbalance_ema"
+        - "*orderflow_efficiency*"
+        - "*absorption_pressure*"
+        - "*cvd_price_divergence*"
+        - "log_return_stable_*"
+        - "close_denoised_log_return_stable_*"
+        - "realized_vol_14_stable_*"
+        - "gk_vol_14_stable_*"
+        - "atr_14_pct_stable_*"
+        - "adx_14_stable_*"
+        - "vwap_dist_atr_stable_*"
+        - "volume_log_zscore_stable_*"
+        - "volume_denoised_log_zscore_stable_*"
+        - "4h_log_return_stable_*"
+        - "4h_close_denoised_log_return_stable_*"
+        - "4h_realized_vol_14_stable_*"
+        - "4h_gk_vol_14_stable_*"
+        - "4h_atr_14_pct_stable_*"
+        - "4h_adx_14_stable_*"
+        - "4h_vwap_dist_atr_stable_*"
+        - "4h_volume_log_zscore_stable_*"
+        - "4h_volume_denoised_log_zscore_stable_*"
+    baseline_stable_plus_1h_flow_rv_interactions:
+      description: Stability control plus bounded 1H order-flow interactions with local realized-volatility regime rank.
+      inherit: baseline_plus_4h_bounded_whale_no_4h_tier1_no_4h_pure_volatility_no_1h_pure_volatility
+      include_patterns:
+        - "taker_imbalance_x_rv14_rank_*"
+        - "taker_imbalance_slope_x_rv14_rank_*"
+        - "signed_ltp_x_rv14_rank_*"
+        - "ltp12_rank_x_rv14_rank_*"
+        - "ltp24_rank_x_rv14_rank_*"
+    baseline_stable_plus_1h_flow_gk_interactions:
+      description: Stability control plus bounded 1H order-flow interactions with local Garman-Klass volatility regime rank.
+      inherit: baseline_plus_4h_bounded_whale_no_4h_tier1_no_4h_pure_volatility_no_1h_pure_volatility
+      include_patterns:
+        - "taker_imbalance_x_gk14_rank_*"
+        - "taker_imbalance_slope_x_gk14_rank_*"
+        - "signed_ltp_x_gk14_rank_*"
+        - "ltp12_rank_x_gk14_rank_*"
+        - "ltp24_rank_x_gk14_rank_*"
+    baseline_stable_plus_1h_flow_atr_interactions:
+      description: Stability control plus bounded 1H order-flow interactions with local ATR-percent regime rank.
+      inherit: baseline_plus_4h_bounded_whale_no_4h_tier1_no_4h_pure_volatility_no_1h_pure_volatility
+      include_patterns:
+        - "taker_imbalance_x_atr14_rank_*"
+        - "taker_imbalance_slope_x_atr14_rank_*"
+        - "signed_ltp_x_atr14_rank_*"
+        - "ltp12_rank_x_atr14_rank_*"
+        - "ltp24_rank_x_atr14_rank_*"
+    baseline_stable_plus_4h_flow_rv_interactions:
+      description: Stability control plus aligned 4H order-flow interactions with realized-volatility regime rank.
+      inherit: baseline_plus_4h_bounded_whale_no_4h_tier1_no_4h_pure_volatility_no_1h_pure_volatility
+      include_patterns:
+        - "4h_taker_imbalance_x_rv14_rank_*"
+        - "4h_taker_imbalance_slope_x_rv14_rank_*"
+        - "4h_signed_ltp_x_rv14_rank_*"
+        - "4h_ltp12_rank_x_rv14_rank_*"
+        - "4h_ltp24_rank_x_rv14_rank_*"
+    baseline_stable_plus_4h_flow_gk_interactions:
+      description: Stability control plus aligned 4H order-flow interactions with Garman-Klass volatility regime rank.
+      inherit: baseline_plus_4h_bounded_whale_no_4h_tier1_no_4h_pure_volatility_no_1h_pure_volatility
+      include_patterns:
+        - "4h_taker_imbalance_x_gk14_rank_*"
+        - "4h_taker_imbalance_slope_x_gk14_rank_*"
+        - "4h_signed_ltp_x_gk14_rank_*"
+        - "4h_ltp12_rank_x_gk14_rank_*"
+        - "4h_ltp24_rank_x_gk14_rank_*"
+    baseline_stable_plus_4h_flow_atr_interactions:
+      description: Stability control plus aligned 4H order-flow interactions with ATR-percent regime rank.
+      inherit: baseline_plus_4h_bounded_whale_no_4h_tier1_no_4h_pure_volatility_no_1h_pure_volatility
+      include_patterns:
+        - "4h_taker_imbalance_x_atr14_rank_*"
+        - "4h_taker_imbalance_slope_x_atr14_rank_*"
+        - "4h_signed_ltp_x_atr14_rank_*"
+        - "4h_ltp12_rank_x_atr14_rank_*"
+        - "4h_ltp24_rank_x_atr14_rank_*"

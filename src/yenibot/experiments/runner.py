@@ -1,218 +1,58 @@
 from __future__ import annotations
 
+from __future__ import annotations
 import copy
-import hashlib
 import json
-import re
-import shutil
-import zipfile
 from datetime import datetime, timezone
 from fnmatch import fnmatch
-from itertools import combinations
 from pathlib import Path
 from typing import Any
-
 import joblib
 import numpy as np
 import pandas as pd
 import torch
 from sklearn.metrics import average_precision_score
-
 from yenibot.diagnostics import (
-    attach_threshold_summary_to_phase1_report,
-    calibration_table,
-    calibrate_split_probabilities_from_val,
-    bad_fold_regime_diagnostics,
-    experiment_ledger_diagnostics,
-    feature_group_diagnostics,
-    feature_profile_diagnostics,
-    fold_diagnostics,
-    mtf_leakage_diagnostics,
-    phase1_report,
-    recent_fold_diagnostics,
-    regime_by_fold_diagnostics,
-    regime_diagnostics,
-    score_band_by_fold_diagnostics,
     score_band_diagnostics,
-    score_band_summary_diagnostics,
-    score_policy_grid_diagnostics,
     select_score_policy,
-    score_lift_by_fold_diagnostics,
-    score_lift_diagnostics,
-    stationarity_policy_diagnostics,
-    threshold_diagnostics,
-    threshold_grid_diagnostics,
-    threshold_grid_summary_diagnostics,
-    threshold_summary_diagnostics,
     write_phase1_diagnostic_bundle,
 )
 from yenibot.features import filter_feature_columns, resolve_feature_profile, select_feature_columns
 from yenibot.training import run_walk_forward_training
 from yenibot.training.trainer import _add_regime_probs, _build_model, _device, _make_dataset, _predict_dataset
 
-
-def _cfg(config: Any, path: list[str], default: Any = None) -> Any:
-    current = config
-    for key in path:
-        if isinstance(current, dict):
-            if key not in current:
-                return default
-            current = current[key]
-        else:
-            if not hasattr(current, key):
-                return default
-            current = getattr(current, key)
-    return current
-
-
-def _set_cfg(config: dict[str, Any], path: list[str], value: Any) -> None:
-    current: dict[str, Any] = config
-    for key in path[:-1]:
-        current = current.setdefault(key, {})
-    current[path[-1]] = value
-
-
-def _json_ready(value: Any) -> Any:
-    if isinstance(value, dict):
-        return {str(key): _json_ready(item) for key, item in value.items()}
-    if isinstance(value, (list, tuple, set)):
-        return [_json_ready(item) for item in value]
-    if isinstance(value, (np.integer,)):
-        return int(value)
-    if isinstance(value, (np.floating,)):
-        number = float(value)
-        return number if np.isfinite(number) else None
-    if isinstance(value, float):
-        return value if np.isfinite(value) else None
-    if isinstance(value, (np.bool_,)):
-        return bool(value)
-    if isinstance(value, pd.Timestamp):
-        return value.isoformat()
-    if isinstance(value, Path):
-        return str(value)
-    return value
-
-
-def _hash_payload(payload: Any) -> str:
-    encoded = json.dumps(_json_ready(payload), sort_keys=True, separators=(",", ":"), default=str).encode("utf-8")
-    return hashlib.sha256(encoded).hexdigest()
-
-
-def _slug(text: str) -> str:
-    return re.sub(r"[^A-Za-z0-9_.-]+", "_", text).strip("_")
-
-
-def _table_markdown(title: str, frame: pd.DataFrame) -> str:
-    lines = [f"# {title}", ""]
-    if frame.empty:
-        lines.append("No rows were produced.")
-        return "\n".join(lines)
-    lines.append("| " + " | ".join(frame.columns) + " |")
-    lines.append("| " + " | ".join(["---"] * len(frame.columns)) + " |")
-    for _, row in frame.iterrows():
-        lines.append("| " + " | ".join(str(row[column]) for column in frame.columns) + " |")
-    return "\n".join(lines)
-
-
-def _holdout_policy_action(
-    *,
-    frozen: dict[str, Any],
-    observed_policy: dict[str, Any],
-    frozen_selection: str,
-    config: dict[str, Any] | None = None,
-    holdout_boundary_passed: bool = True,
-) -> str:
-    if not holdout_boundary_passed:
-        return "invalid_holdout_training_boundary_rerun_04"
-    policy_status = str(_cfg(config or {}, ["experiments", "policy_review", "status"], "")).lower()
-    if any(token in policy_status for token in ("failed", "invalidated", "retired")):
-        return "retired_frozen_policy_keep_control_profile"
-    frozen_consistent = bool(frozen.get("holdout_policy_consistency_pass", False))
-    frozen_signal = bool(frozen.get("holdout_signal_pass", False))
-    frozen_threshold = bool(frozen.get("holdout_threshold_pass", False))
-    observed_consistent = bool(observed_policy.get("holdout_policy_consistency_pass", False))
-    observed_name = str(observed_policy.get("candidate", ""))
-    threshold_allowed = bool(_cfg(config or {}, ["experiments", "policy_review", "threshold_deployment_allowed"], False))
-    if frozen_consistent and frozen_signal and frozen_threshold and threshold_allowed:
-        return "review_frozen_threshold_and_score_policy"
-    if frozen_consistent and frozen_signal:
-        return "review_frozen_score_band_policy_only_no_threshold_deployment"
-    if observed_consistent and observed_name and observed_name != frozen_selection:
-        return "holdout_only_candidate_do_not_promote_without_future_oos"
-    return "keep_control_profile"
-
-
-def profile_config(config: dict[str, Any], profile: str) -> dict[str, Any]:
-    """Return an in-memory config copy with the requested active feature profile."""
-
-    updated = copy.deepcopy(config)
-    _set_cfg(updated, ["features", "active_profile"], profile)
-    resolve_feature_profile(updated)
-    overrides = _profile_config_overrides(updated, profile)
-    if overrides:
-        _deep_update(updated, overrides)
-    return updated
-
-
-def _deep_update(base: dict[str, Any], updates: dict[str, Any]) -> dict[str, Any]:
-    for key, value in updates.items():
-        if isinstance(value, dict) and isinstance(base.get(key), dict):
-            _deep_update(base[key], value)
-        else:
-            base[key] = copy.deepcopy(value)
-    return base
-
-
-def _profile_config_overrides(config: dict[str, Any], profile: str) -> dict[str, Any]:
-    profiles = _cfg(config, ["features", "profiles"], {}) or {}
-    if not isinstance(profiles, dict):
-        return {}
-
-    def load(name: str, seen: set[str] | None = None) -> dict[str, Any]:
-        seen = set() if seen is None else seen
-        if name in seen:
-            raise ValueError(f"Cyclic feature profile inheritance detected at {name}")
-        seen.add(name)
-        current = profiles.get(name)
-        if not isinstance(current, dict):
-            return {}
-        parent_name = current.get("inherit")
-        overrides = load(str(parent_name), seen) if parent_name else {}
-        current_overrides = current.get("config_overrides", current.get("training_overrides", {})) or {}
-        if not isinstance(current_overrides, dict):
-            raise ValueError(f"Feature profile config_overrides must be a mapping: {name}")
-        return _deep_update(overrides, current_overrides)
-
-    return load(str(profile))
-
-
-def _profile_rejection_reason(profile: str, experiments: dict[str, Any]) -> str:
-    memory = experiments.get("experiment_memory", {}) or {}
-    if not bool(memory.get("enabled", False)) or not bool(memory.get("reject_retests", True)):
-        return ""
-    if profile in {str(item) for item in memory.get("allow_retest_profiles", []) or []}:
-        return ""
-
-    rejected_profiles = memory.get("rejected_profiles", {}) or {}
-    if isinstance(rejected_profiles, dict) and profile in rejected_profiles:
-        value = rejected_profiles[profile]
-        if isinstance(value, dict):
-            return str(value.get("reason") or "historically_rejected_profile")
-        return str(value or "historically_rejected_profile")
-
-    for item in memory.get("rejected_profile_patterns", []) or []:
-        if isinstance(item, str):
-            pattern = item
-            reason = "historically_rejected_profile_pattern"
-        elif isinstance(item, dict):
-            pattern = str(item.get("pattern", ""))
-            reason = str(item.get("reason") or "historically_rejected_profile_pattern")
-        else:
-            continue
-        if pattern and fnmatch(profile, pattern):
-            return reason
-    return ""
-
+from .utils import (
+    _cfg, _set_cfg, _json_ready, _hash_payload, _slug, _table_markdown,
+    _numeric_mean, _float, _optional_float, _is_stability_scope, _diagnostic_candidate_type, _entry_threshold_policy_frame,
+    _rank_ic_for_frame, _score_ks_statistic, _read_json, _write_json, _TRAINING_EXECUTION_KEYS,
+    _test_predictions, summarize_profile_predictions, _future_oos_monitor_state,
+    _frame_window, _threshold_summary_metric
+)
+from .profile_resolver import profile_config, _profile_config_overrides
+from .memory import _profile_rejection_reason
+from .holdout import (
+    _holdout_boundary_audit_frame,
+    _holdout_reservation_frame, _attach_holdout_soft_pass, _holdout_policy_action
+)
+from .triage import (
+    _passes_triage, _passes_full, _auto_full_profiles, _fold_reliability_gate_frame, _fold_reliability_gate_summary_frame
+)
+from .blend import (
+    _profile_blend_entries, _profile_blend_frame, _profile_blend_review_frame,
+    _profile_blend_leaders, _best_profile_blend
+)
+from .report_writer import (
+    _write_probability_quality_forensics,
+    _write_score_distribution_shift, _write_fold_reliability_gate,
+    _write_forensics_reports, _payoff_alignment_frame, _payoff_alignment_summary_frame,
+    _write_payoff_alignment,
+    _payoff_policy_robustness_frame,
+    _payoff_policy_robustness_summary_frame,
+    _write_payoff_policy_robustness,
+    _write_frozen_policy_robustness, _write_profile_delta,
+    _write_seed_audit_files, _write_seed_ensemble_files, _write_profile_blend_files, _write_profile_diagnostic_summaries,
+    _write_experiment_bundle, _write_experiment_slim_bundle
+)
 
 def _filter_memory_rejected_profiles(
     profiles: list[str],
@@ -235,10 +75,8 @@ def _filter_memory_rejected_profiles(
         selected.append(profile)
     return selected, skipped
 
-
 def _policy_status_is_retired_or_failed(status: str) -> bool:
     return any(token in str(status).lower() for token in ("failed", "invalidated", "retired"))
-
 
 def _future_oos_allowed_benchmark_profiles(config: dict[str, Any], control_profile: str) -> list[str]:
     policy_review = _cfg(config, ["experiments", "policy_review"], {}) or {}
@@ -262,7 +100,6 @@ def _future_oos_allowed_benchmark_profiles(config: dict[str, Any], control_profi
             if profile and profile not in allowed:
                 allowed.append(profile)
     return allowed
-
 
 def _experiment_policy_guard(settings: dict[str, Any], config: dict[str, Any]) -> dict[str, Any]:
     policy_review = _cfg(config, ["experiments", "policy_review"], {}) or {}
@@ -300,7 +137,6 @@ def _experiment_policy_guard(settings: dict[str, Any], config: dict[str, Any]) -
         "allowed_benchmark_profiles": allowed,
         **monitor_state,
     }
-
 
 def _apply_experiment_policy_guard(settings: dict[str, Any], config: dict[str, Any]) -> dict[str, Any]:
     updated = copy.deepcopy(settings)
@@ -363,7 +199,6 @@ def _apply_experiment_policy_guard(settings: dict[str, Any], config: dict[str, A
     updated["experiment_policy_guard"] = guard
     return updated
 
-
 def experiment_settings(config: dict[str, Any]) -> dict[str, Any]:
     experiments = copy.deepcopy(_cfg(config, ["experiments"], {}) or {})
     control = str(experiments.get("control_profile") or _cfg(config, ["features", "active_profile"]))
@@ -414,18 +249,15 @@ def experiment_settings(config: dict[str, Any]) -> dict[str, Any]:
     experiments = _apply_experiment_policy_guard(experiments, config)
     return experiments
 
-
 def _profile_requires_intrahour_features(config: dict[str, Any], profile: str) -> bool:
     profile_cfg = profile_config(config, profile)
     resolved = resolve_feature_profile(profile_cfg)
     return any("ih15" in str(pattern) for pattern in resolved.get("include_patterns", []) or [])
 
-
 def _profile_requires_futures_context_features(config: dict[str, Any], profile: str) -> bool:
     profile_cfg = profile_config(config, profile)
     resolved = resolve_feature_profile(profile_cfg)
     return any("fut_" in str(pattern) for pattern in resolved.get("include_patterns", []) or [])
-
 
 def _missing_intrahour_include_patterns(config: dict[str, Any], profile: str, feature_columns: tuple[str, ...]) -> list[str]:
     profile_cfg = profile_config(config, profile)
@@ -436,7 +268,6 @@ def _missing_intrahour_include_patterns(config: dict[str, Any], profile: str, fe
         for pattern in patterns
         if not any(fnmatch(column, pattern) for column in feature_columns)
     ]
-
 
 def _preflight_experiment_profiles(
     settings: dict[str, Any],
@@ -551,14 +382,11 @@ def _preflight_experiment_profiles(
     updated["skipped_profiles"] = skipped_profiles
     return updated
 
-
 def experiment_root(checkpoint_dir: str | Path) -> Path:
     return Path(checkpoint_dir) / "experiments"
 
-
 def new_run_id() -> str:
     return datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
-
 
 def _experiment_signature(config: dict[str, Any], settings: dict[str, Any]) -> dict[str, Any]:
     comparable_settings = copy.deepcopy(settings)
@@ -572,7 +400,6 @@ def _experiment_signature(config: dict[str, Any], settings: dict[str, Any]) -> d
         "walk_forward": _cfg(config, ["walk_forward"], {}),
         "validation": _cfg(config, ["validation"], {}),
     }
-
 
 def _matching_latest_run(checkpoint_dir: str | Path, signature_hash: str) -> Path | None:
     root = experiment_root(checkpoint_dir)
@@ -590,7 +417,6 @@ def _matching_latest_run(checkpoint_dir: str | Path, signature_hash: str) -> Pat
         if manifest.get("signature_hash") == signature_hash:
             return run
     return None
-
 
 def resolve_experiment_run_id(
     checkpoint_dir: str | Path,
@@ -610,7 +436,6 @@ def resolve_experiment_run_id(
             return existing.name, "matching_existing"
     return new_run_id(), "new"
 
-
 def latest_experiment_run(checkpoint_dir: str | Path) -> Path:
     root = experiment_root(checkpoint_dir)
     runs = sorted([path for path in root.glob("*") if path.is_dir()], key=lambda path: path.name)
@@ -618,17 +443,8 @@ def latest_experiment_run(checkpoint_dir: str | Path) -> Path:
         raise FileNotFoundError(f"No experiment runs found under {root}")
     return runs[-1]
 
-
 def profile_run_dir(checkpoint_dir: str | Path, run_id: str, profile: str) -> Path:
     return experiment_root(checkpoint_dir) / run_id / _slug(profile)
-
-
-def _frame_window(frame: pd.DataFrame) -> dict[str, str]:
-    if "timestamp" not in frame.columns or frame.empty:
-        return {"data_start": "", "data_end": ""}
-    timestamps = pd.to_datetime(frame["timestamp"], utc=True)
-    return {"data_start": str(timestamps.min()), "data_end": str(timestamps.max())}
-
 
 def _training_signature(
     *,
@@ -650,32 +466,11 @@ def _training_signature(
         **_frame_window(frame),
     }
 
-
 def _manifest_path(output_dir: Path) -> Path:
     return output_dir / "training_manifest.json"
 
-
-def _read_json(path: Path) -> dict[str, Any]:
-    return json.loads(path.read_text(encoding="utf-8"))
-
-
-def _write_json(path: Path, payload: dict[str, Any]) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(_json_ready(payload), indent=2, sort_keys=True), encoding="utf-8")
-
-
-_TRAINING_EXECUTION_KEYS = (
-    "run_id_source",
-    "training_executed_count",
-    "training_skipped_count",
-    "all_training_scopes_reused",
-    "reused_training_scopes",
-)
-
-
 def _training_execution_summary_path(run_dir: Path) -> Path:
     return run_dir / "training_execution_summary.json"
-
 
 def _training_execution_summary(
     *,
@@ -702,7 +497,6 @@ def _training_execution_summary(
         ],
         "created_at": datetime.now(timezone.utc).isoformat(),
     }
-
 
 def _load_training_execution_summary(run_dir: Path, run_manifest: dict[str, Any]) -> dict[str, Any]:
     summary_path = _training_execution_summary_path(run_dir)
@@ -737,7 +531,6 @@ def _load_training_execution_summary(run_dir: Path, run_manifest: dict[str, Any]
     }
     return summary
 
-
 def _is_complete(output_dir: Path, expected_signature_hash: str) -> bool:
     manifest_path = _manifest_path(output_dir)
     predictions_path = output_dir / "predictions_all.parquet"
@@ -745,348 +538,6 @@ def _is_complete(output_dir: Path, expected_signature_hash: str) -> bool:
         return False
     manifest = _read_json(manifest_path)
     return bool(manifest.get("completed")) and manifest.get("signature_hash") == expected_signature_hash
-
-
-def _test_predictions(predictions: pd.DataFrame) -> pd.DataFrame:
-    if "split" in predictions.columns:
-        return predictions[predictions["split"] == "test"].copy()
-    return predictions.copy()
-
-
-def _threshold_guard_from_report(report: dict[str, Any], *, prefix: str = "") -> dict[str, Any]:
-    guarded = report.get("threshold_guarded", {}) or {}
-    source = str(guarded.get("threshold_source", ""))
-    if prefix and source:
-        source = f"{prefix}_{source}"
-    return {
-        "threshold_source": source,
-        "reject_reason": str(guarded.get("reject_reason", "")),
-        "threshold_mean": guarded.get("threshold_mean", np.nan),
-        "f1": guarded.get("test_f1_at_guarded_threshold", np.nan),
-        "precision": guarded.get("test_precision_at_guarded_threshold", np.nan),
-        "recall": guarded.get("test_recall_at_guarded_threshold", np.nan),
-        "pred_long_rate": guarded.get("test_pred_long_rate_at_guarded_threshold", np.nan),
-        "passed": bool(report.get("passed_threshold_guarded", False)),
-    }
-
-
-def _threshold_summary_metric(threshold_summary: pd.DataFrame | None, metric: str) -> float:
-    if threshold_summary is None or threshold_summary.empty:
-        return np.nan
-    if "metric" not in threshold_summary.columns or "mean" not in threshold_summary.columns:
-        return np.nan
-    row = threshold_summary.loc[threshold_summary["metric"].astype(str) == str(metric)]
-    if row.empty:
-        return np.nan
-    return _float(row.iloc[0].to_dict(), "mean")
-
-
-def _threshold_selection_score(
-    threshold_summary: pd.DataFrame | None,
-    source: str,
-) -> float:
-    if "constrained" in str(source):
-        score = _threshold_summary_metric(threshold_summary, "source_constrained_f1")
-        if np.isfinite(score):
-            return score
-    score = _threshold_summary_metric(threshold_summary, "source_best_f1")
-    if np.isfinite(score):
-        return score
-    return np.nan
-
-
-def _threshold_candidate_is_guarded(
-    candidate: dict[str, Any],
-    *,
-    max_pred_long_rate: float,
-    min_precision: float,
-) -> bool:
-    f1 = _optional_float(candidate.get("f1"))
-    precision = _optional_float(candidate.get("precision"))
-    pred_rate = _optional_float(candidate.get("pred_long_rate"))
-    return bool(
-        f1 is not None
-        and precision is not None
-        and pred_rate is not None
-        and pred_rate <= max_pred_long_rate
-        and precision >= min_precision
-    )
-
-
-def _select_official_threshold_candidate(
-    *,
-    raw_report: dict[str, Any],
-    raw_threshold_summary: pd.DataFrame | None,
-    calibrated_threshold_report: dict[str, Any] | None,
-    calibrated_threshold_summary: pd.DataFrame | None,
-    config: dict[str, Any],
-) -> dict[str, Any]:
-    threshold_cfg = _cfg(config, ["validation", "threshold_checks"], {}) or {}
-    max_pred_long_rate = float(threshold_cfg.get("max_pred_long_rate", 0.70))
-    min_precision = float(threshold_cfg.get("min_precision", 0.30))
-    raw_candidate = _threshold_guard_from_report(raw_report)
-    raw_candidate["candidate_order"] = 0
-    raw_candidate["selection_score"] = _threshold_selection_score(
-        raw_threshold_summary,
-        str(raw_candidate.get("threshold_source", "")),
-    )
-    candidates = [raw_candidate]
-    if calibrated_threshold_report:
-        calibrated_candidate = _threshold_guard_from_report(calibrated_threshold_report, prefix="calibrated")
-        calibrated_candidate["candidate_order"] = 1
-        calibrated_candidate["selection_score"] = _threshold_selection_score(
-            calibrated_threshold_summary,
-            str(calibrated_candidate.get("threshold_source", "")),
-        )
-        candidates.append(calibrated_candidate)
-    guarded_candidates = [
-        candidate
-        for candidate in candidates
-        if _threshold_candidate_is_guarded(
-            candidate,
-            max_pred_long_rate=max_pred_long_rate,
-            min_precision=min_precision,
-        )
-    ]
-    if guarded_candidates:
-        selected = max(
-            guarded_candidates,
-            key=lambda item: (
-                _optional_float(item.get("selection_score")) or -np.inf,
-                -int(item.get("candidate_order", 999) or 999),
-            ),
-        )
-    else:
-        selected = candidates[0]
-    selected = dict(selected)
-    selected["uses_calibration"] = str(selected.get("threshold_source", "")).startswith("calibrated_")
-    selected["candidate_count"] = len(candidates)
-    selected["guarded_candidate_count"] = len(guarded_candidates)
-    return selected
-
-
-def _apply_official_threshold_fields(
-    row: dict[str, Any],
-    ledger: pd.DataFrame,
-    *,
-    official: dict[str, Any],
-    calibrated: dict[str, Any] | None = None,
-) -> None:
-    calibrated = calibrated or {}
-    additions = {
-        "official_threshold_source": str(official.get("threshold_source", "")),
-        "official_threshold_reason": str(official.get("reject_reason", "")),
-        "official_threshold_mean": official.get("threshold_mean", np.nan),
-        "test_f1_at_official_threshold": official.get("f1", np.nan),
-        "test_precision_at_official_threshold": official.get("precision", np.nan),
-        "test_recall_at_official_threshold": official.get("recall", np.nan),
-        "test_pred_long_rate_at_official_threshold": official.get("pred_long_rate", np.nan),
-        "official_threshold_uses_calibration": bool(official.get("uses_calibration", False)),
-        "official_threshold_candidate_count": int(official.get("candidate_count", 1) or 1),
-        "official_threshold_guarded_candidate_count": int(official.get("guarded_candidate_count", 0) or 0),
-        "official_threshold_selection_score": official.get("selection_score", np.nan),
-        "calibrated_guarded_threshold_source": str(calibrated.get("threshold_source", "")),
-        "calibrated_guarded_threshold_reason": str(calibrated.get("reject_reason", "")),
-        "calibrated_guarded_threshold_mean": calibrated.get("threshold_mean", np.nan),
-        "test_f1_at_calibrated_guarded_threshold": calibrated.get("f1", np.nan),
-        "test_precision_at_calibrated_guarded_threshold": calibrated.get("precision", np.nan),
-        "test_recall_at_calibrated_guarded_threshold": calibrated.get("recall", np.nan),
-        "test_pred_long_rate_at_calibrated_guarded_threshold": calibrated.get("pred_long_rate", np.nan),
-    }
-    row.update(additions)
-    for column, value in additions.items():
-        ledger.loc[:, column] = value
-
-
-def summarize_profile_predictions(
-    predictions: pd.DataFrame,
-    config: dict[str, Any],
-    *,
-    profile: str,
-    feature_columns: list[str],
-    fold_scope: str,
-    promotable: bool | None = None,
-    reject_reason: str = "",
-) -> dict[str, Any]:
-    profile_cfg = profile_config(config, profile)
-    test_predictions = _test_predictions(predictions)
-    report = phase1_report(test_predictions, profile_cfg)
-    calibration = calibration_table(
-        test_predictions["label"],
-        test_predictions["prob_long"],
-        bins=int(_cfg(profile_cfg, ["validation", "calibration_bins"], 10)),
-    )
-    fold_metrics = fold_diagnostics(test_predictions)
-    regime_metrics = regime_diagnostics(test_predictions)
-    regime_by_fold = regime_by_fold_diagnostics(
-        test_predictions,
-        fold_metrics,
-        bad_ic=float(_cfg(profile_cfg, ["validation", "bad_fold_ic_threshold"], -0.08)),
-    )
-    bad_fold_regime = bad_fold_regime_diagnostics(regime_by_fold)
-    threshold_cfg = _cfg(profile_cfg, ["validation", "threshold_checks"], {}) or {}
-    threshold_metrics = threshold_diagnostics(
-        predictions,
-        max_pred_long_rate=float(threshold_cfg.get("max_pred_long_rate", 0.70)),
-        min_precision=float(threshold_cfg.get("min_precision", 0.30)),
-    )
-    threshold_summary = threshold_summary_diagnostics(threshold_metrics)
-    report = attach_threshold_summary_to_phase1_report(report, threshold_summary, profile_cfg)
-    calibrated_report = None
-    calibrated_calibration = pd.DataFrame()
-    calibrated_predictions = pd.DataFrame()
-    calibrated_threshold_report = None
-    calibrated_threshold_metrics = pd.DataFrame()
-    calibrated_threshold_summary = pd.DataFrame()
-    calibration_cfg = _cfg(profile_cfg, ["validation", "calibration"], {}) or {}
-    if bool(calibration_cfg.get("enabled", False)):
-        try:
-            calibration_method = str(calibration_cfg.get("method", "isotonic"))
-            calibrated_splits = calibrate_split_probabilities_from_val(
-                predictions,
-                method=calibration_method,
-            )
-            calibrated_predictions = calibrated_splits[calibrated_splits["split"] == "test"].copy()
-            report_frame = calibrated_predictions.copy()
-            report_frame["prob_long"] = report_frame["prob_long_calibrated"]
-            calibrated_report = phase1_report(report_frame, profile_cfg)
-            calibrated_calibration = calibration_table(
-                report_frame["label"],
-                report_frame["prob_long"],
-                bins=int(_cfg(profile_cfg, ["validation", "calibration_bins"], 10)),
-            )
-            calibrated_threshold_metrics = threshold_diagnostics(
-                calibrated_splits,
-                score_column="prob_long_calibrated",
-                max_pred_long_rate=float(threshold_cfg.get("max_pred_long_rate", 0.70)),
-                min_precision=float(threshold_cfg.get("min_precision", 0.30)),
-            )
-            calibrated_threshold_summary = threshold_summary_diagnostics(calibrated_threshold_metrics)
-            calibrated_threshold_report = attach_threshold_summary_to_phase1_report(
-                dict(calibrated_report),
-                calibrated_threshold_summary,
-                profile_cfg,
-            )
-        except ValueError:
-            calibrated_report = None
-            calibrated_calibration = pd.DataFrame()
-            calibrated_predictions = pd.DataFrame()
-            calibrated_threshold_report = None
-            calibrated_threshold_metrics = pd.DataFrame()
-            calibrated_threshold_summary = pd.DataFrame()
-    score_bins = int(_cfg(profile_cfg, ["validation", "score_lift_bins"], _cfg(profile_cfg, ["validation", "calibration_bins"], 10)))
-    score_bands = _cfg(profile_cfg, ["validation", "score_bands"], None)
-    policy_cfg = _cfg(profile_cfg, ["validation", "policy_selection"], {}) or {}
-    threshold_caps = [float(value) for value in policy_cfg.get("threshold_caps", [0.30, 0.40, 0.50, 0.60, 0.70])]
-    score_lift = score_lift_diagnostics(test_predictions, bins=score_bins)
-    score_lift_by_fold = score_lift_by_fold_diagnostics(test_predictions, bins=score_bins)
-    score_band_lift = score_band_diagnostics(test_predictions, bins=score_bins, bands=score_bands)
-    score_band_by_fold = score_band_by_fold_diagnostics(test_predictions, bins=score_bins, bands=score_bands)
-    score_band_summary = score_band_summary_diagnostics(score_band_by_fold)
-    threshold_grid = threshold_grid_diagnostics(
-        predictions,
-        max_pred_long_rates=threshold_caps,
-        min_precision=float(threshold_cfg.get("min_precision", 0.30)),
-    )
-    threshold_grid_summary = threshold_grid_summary_diagnostics(threshold_grid)
-    score_policy_grid = score_policy_grid_diagnostics(
-        predictions,
-        bins=score_bins,
-        bands=score_bands,
-        threshold_caps=threshold_caps,
-        min_precision=float(threshold_cfg.get("min_precision", 0.30)),
-    )
-    score_policy_selection = select_score_policy(score_policy_grid, profile_cfg)
-    recent = recent_fold_diagnostics(
-        fold_metrics,
-        recent_folds=int(_cfg(profile_cfg, ["validation", "recent_folds"], 5)),
-    )
-    mtf = mtf_leakage_diagnostics(test_predictions)
-    stationarity = stationarity_policy_diagnostics(feature_columns, profile_cfg)
-    data_window = _frame_window(test_predictions)
-    ledger = experiment_ledger_diagnostics(
-        report=report,
-        config=profile_cfg,
-        feature_columns=feature_columns,
-        fold_metrics=fold_metrics,
-        recent_fold_summary=recent,
-        threshold_summary=threshold_summary,
-        score_band_lift=score_band_lift,
-        score_lift_by_fold=score_lift_by_fold,
-        score_band_summary=score_band_summary,
-        fold_scope=fold_scope,
-        data_start=data_window["data_start"],
-        data_end=data_window["data_end"],
-        promotable=promotable,
-        reject_reason=reject_reason,
-    )
-    row = ledger.iloc[0].to_dict()
-    calibrated_guard = (
-        _threshold_guard_from_report(calibrated_threshold_report, prefix="calibrated")
-        if calibrated_threshold_report
-        else {}
-    )
-    official_threshold = _select_official_threshold_candidate(
-        raw_report=report,
-        raw_threshold_summary=threshold_summary,
-        calibrated_threshold_report=calibrated_threshold_report,
-        calibrated_threshold_summary=calibrated_threshold_summary,
-        config=profile_cfg,
-    )
-    _apply_official_threshold_fields(
-        row,
-        ledger,
-        official=official_threshold,
-        calibrated=calibrated_guard,
-    )
-    min_long_f1 = float(_cfg(profile_cfg, ["validation", "min_long_f1"], 0.45))
-    threshold_cfg = _cfg(profile_cfg, ["validation", "threshold_checks"], {}) or {}
-    max_pred_long_rate = float(threshold_cfg.get("max_pred_long_rate", 0.70))
-    official_f1 = _optional_float(row.get("test_f1_at_official_threshold"))
-    official_pred_rate = _optional_float(row.get("test_pred_long_rate_at_official_threshold"))
-    official_checks = dict(report.get("checks", {}) or {})
-    official_checks["long_f1"] = bool(official_f1 is not None and official_f1 > min_long_f1)
-    official_checks["threshold_pred_long_rate"] = bool(
-        official_pred_rate is not None and official_pred_rate <= max_pred_long_rate
-    )
-    row["passed_phase1_official_threshold"] = all(bool(value) for value in official_checks.values())
-    ledger.loc[:, "passed_phase1_official_threshold"] = row["passed_phase1_official_threshold"]
-    row["mtf_leakage_passed"] = bool(mtf.empty or mtf["passed"].all())
-    row["stationarity_policy_passed"] = bool(stationarity.empty or stationarity["passed"].all())
-    row["fold_count"] = int(fold_metrics["fold"].nunique()) if not fold_metrics.empty else 0
-    return {
-        "report": report,
-        "calibration": calibration,
-        "calibrated_report": calibrated_report,
-        "calibrated_calibration": calibrated_calibration,
-        "calibrated_predictions": calibrated_predictions,
-        "calibrated_threshold_report": calibrated_threshold_report,
-        "calibrated_threshold_metrics": calibrated_threshold_metrics,
-        "calibrated_threshold_summary": calibrated_threshold_summary,
-        "fold_metrics": fold_metrics,
-        "regime_metrics": regime_metrics,
-        "regime_by_fold": regime_by_fold,
-        "bad_fold_regime": bad_fold_regime,
-        "threshold_metrics": threshold_metrics,
-        "threshold_summary": threshold_summary,
-        "threshold_grid": threshold_grid,
-        "threshold_grid_summary": threshold_grid_summary,
-        "score_lift": score_lift,
-        "score_lift_by_fold": score_lift_by_fold,
-        "score_band_lift": score_band_lift,
-        "score_band_by_fold": score_band_by_fold,
-        "score_band_summary": score_band_summary,
-        "score_policy_grid": score_policy_grid,
-        "score_policy_selection": score_policy_selection,
-        "recent_fold_summary": recent,
-        "mtf_leakage": mtf,
-        "stationarity_policy": stationarity,
-        "feature_groups": feature_group_diagnostics(feature_columns),
-        "feature_profile": feature_profile_diagnostics(feature_columns, profile_cfg),
-        "ledger": ledger,
-        "row": row,
-    }
-
 
 def run_profile_experiment(
     frame: pd.DataFrame,
@@ -1154,143 +605,6 @@ def run_profile_experiment(
         "summary": diagnostics["row"],
     }
 
-
-def _float(row: dict[str, Any], key: str, default: float = np.nan) -> float:
-    value = row.get(key, default)
-    try:
-        return float(value)
-    except (TypeError, ValueError):
-        return default
-
-
-def _optional_float(value: Any) -> float | None:
-    try:
-        number = float(value)
-    except (TypeError, ValueError):
-        return None
-    return number if np.isfinite(number) else None
-
-
-def _optional_gate_float(gates: dict[str, Any], key: str, default: float | None = None) -> float | None:
-    value = gates.get(key, default)
-    if value is None:
-        return None
-    return float(value)
-
-
-def _metric_or(row: dict[str, Any], key: str, fallback: float) -> float:
-    value = _float(row, key, np.nan)
-    if np.isnan(value):
-        return fallback
-    return value
-
-
-def _passes_triage(row: dict[str, Any], control: dict[str, Any], config: dict[str, Any]) -> tuple[bool, str]:
-    gates = _cfg(config, ["experiments", "promotion_gates", "triage"], {}) or {}
-    reasons = []
-    if _float(row, "mean_rank_ic") < _float(control, "mean_rank_ic") + float(gates.get("min_mean_rank_ic_delta", 0.005)):
-        reasons.append("mean_rank_ic_delta")
-    if _float(row, "std_rank_ic") > _float(control, "std_rank_ic") + float(gates.get("max_std_rank_ic_delta", 0.005)):
-        reasons.append("std_rank_ic")
-    if _float(row, "positive_ic_fraction") < _float(control, "positive_ic_fraction"):
-        reasons.append("positive_ic_fraction")
-    if _float(row, "top_10_lift_global") < float(gates.get("min_top_10_lift_global", 1.05)):
-        reasons.append("top_10_lift_global")
-    if _float(row, "top_10_positive_lift_fold_rate") < float(gates.get("min_top_10_positive_lift_fold_rate", 0.55)):
-        reasons.append("top_10_positive_lift_fold_rate")
-    worst_5_delta = _optional_gate_float(gates, "min_worst_5_rank_ic_delta", None)
-    if worst_5_delta is not None and _float(row, "worst_5_rank_ic_mean") < _float(control, "worst_5_rank_ic_mean") + worst_5_delta:
-        reasons.append("worst_5_rank_ic_delta")
-    negative_delta = _optional_gate_float(gates, "max_negative_ic_fraction_delta", None)
-    if negative_delta is not None and _float(row, "negative_ic_fraction") > _float(control, "negative_ic_fraction") + negative_delta:
-        reasons.append("negative_ic_fraction")
-    bad_fold_lift_floor = _optional_gate_float(gates, "min_top_10_bad_fold_lift_mean", None)
-    if bad_fold_lift_floor is not None and _float(row, "top_10_bad_fold_lift_mean") < bad_fold_lift_floor:
-        reasons.append("top_10_bad_fold_lift_mean")
-    if not bool(row.get("mtf_leakage_passed", False)):
-        reasons.append("mtf_leakage")
-    if not bool(row.get("stationarity_policy_passed", False)):
-        reasons.append("stationarity_policy")
-    return not reasons, ";".join(reasons)
-
-
-def _passes_full(row: dict[str, Any], control: dict[str, Any], config: dict[str, Any]) -> tuple[bool, str]:
-    if bool(row.get("passed_phase1", False)):
-        return True, ""
-    gates = _cfg(config, ["experiments", "promotion_gates", "full"], {}) or {}
-    reasons = []
-    if _float(row, "mean_rank_ic") < _float(control, "mean_rank_ic") + float(gates.get("min_mean_rank_ic_delta", 0.005)):
-        reasons.append("mean_rank_ic_delta")
-    min_positive = max(_float(control, "positive_ic_fraction"), float(gates.get("min_positive_ic_fraction_floor", 0.75)))
-    if _float(row, "positive_ic_fraction") < min_positive:
-        reasons.append("positive_ic_fraction")
-    if _float(row, "std_rank_ic") > _float(control, "std_rank_ic") + float(gates.get("max_std_rank_ic_delta", 0.0)):
-        reasons.append("std_rank_ic")
-    selected_f1 = _metric_or(
-        row,
-        "test_f1_at_official_threshold",
-        _metric_or(
-            row,
-            "test_f1_at_guarded_threshold",
-            _metric_or(
-                row,
-                "test_f1_at_constrained_threshold",
-                _metric_or(row, "test_f1_at_selected_threshold", _float(row, "mean_long_f1")),
-            ),
-        ),
-    )
-    control_selected_f1 = _metric_or(
-        control,
-        "test_f1_at_official_threshold",
-        _metric_or(
-            control,
-            "test_f1_at_guarded_threshold",
-            _metric_or(
-                control,
-                "test_f1_at_constrained_threshold",
-                _metric_or(control, "test_f1_at_selected_threshold", _float(control, "mean_long_f1")),
-            ),
-        ),
-    )
-    selected_f1_floor = _optional_gate_float(gates, "min_selected_threshold_f1", None)
-    if selected_f1_floor is not None and selected_f1 < selected_f1_floor:
-        reasons.append("official_threshold_f1")
-    selected_f1_delta = _optional_gate_float(gates, "min_selected_threshold_f1_delta", None)
-    if selected_f1_delta is not None and selected_f1 < control_selected_f1 + selected_f1_delta:
-        reasons.append("official_threshold_f1_delta")
-    threshold_checks = _cfg(config, ["validation", "threshold_checks"], {}) or {}
-    max_pred_long_rate = float(threshold_checks.get("max_pred_long_rate", 0.70))
-    official_pred_rate = _float(
-        row,
-        "test_pred_long_rate_at_official_threshold",
-        _float(row, "test_pred_long_rate_at_constrained_threshold", np.nan),
-    )
-    if np.isfinite(official_pred_rate) and official_pred_rate > max_pred_long_rate:
-        reasons.append("official_pred_long_rate")
-    mean_long_f1_delta = _optional_gate_float(gates, "min_long_f1_delta", None)
-    if mean_long_f1_delta is not None and _float(row, "mean_long_f1") < _float(control, "mean_long_f1") + mean_long_f1_delta:
-        reasons.append("mean_long_f1_delta")
-    if _float(row, "top_10_lift_global") < _float(control, "top_10_lift_global") + float(gates.get("min_top_10_lift_global_delta", 0.05)):
-        reasons.append("top_10_lift_global_delta")
-    top_lift_floor = _optional_gate_float(gates, "min_top_10_lift_global", None)
-    if top_lift_floor is not None and _float(row, "top_10_lift_global") < top_lift_floor:
-        reasons.append("top_10_lift_global")
-    worst_5_delta = _optional_gate_float(gates, "min_worst_5_rank_ic_delta", None)
-    if worst_5_delta is not None and _float(row, "worst_5_rank_ic_mean") < _float(control, "worst_5_rank_ic_mean") + worst_5_delta:
-        reasons.append("worst_5_rank_ic_delta")
-    negative_delta = _optional_gate_float(gates, "max_negative_ic_fraction_delta", None)
-    if negative_delta is not None and _float(row, "negative_ic_fraction") > _float(control, "negative_ic_fraction") + negative_delta:
-        reasons.append("negative_ic_fraction")
-    bad_fold_lift_delta = _optional_gate_float(gates, "min_top_10_bad_fold_lift_mean_delta", None)
-    if bad_fold_lift_delta is not None and _float(row, "top_10_bad_fold_lift_mean") < _float(control, "top_10_bad_fold_lift_mean") + bad_fold_lift_delta:
-        reasons.append("top_10_bad_fold_lift_mean_delta")
-    if not bool(row.get("mtf_leakage_passed", False)):
-        reasons.append("mtf_leakage")
-    if not bool(row.get("stationarity_policy_passed", False)):
-        reasons.append("stationarity_policy")
-    return not reasons, ";".join(reasons)
-
-
 def _decision_rows(rows: list[dict[str, Any]], config: dict[str, Any], *, scope: str) -> list[dict[str, Any]]:
     if not rows:
         return []
@@ -1313,41 +627,6 @@ def _decision_rows(rows: list[dict[str, Any]], config: dict[str, Any], *, scope:
             updated["reject_reason"] = reason
         decided.append(updated)
     return decided
-
-
-def _auto_full_profiles(settings: dict[str, Any], triage_rows: list[dict[str, Any]]) -> list[str]:
-    control_profile = str(settings["control_profile"])
-    profiles = [control_profile]
-    for profile in settings.get("always_full_profiles", []) or []:
-        profile = str(profile)
-        if profile not in profiles:
-            profiles.append(profile)
-
-    passed_candidates = [
-        row
-        for row in triage_rows
-        if row["profile"] != control_profile and bool(row.get("promotable"))
-    ]
-    passed_candidates = sorted(
-        passed_candidates,
-        key=lambda row: (
-            _float(row, "mean_rank_ic", -np.inf),
-            _float(row, "top_10_lift_global", -np.inf),
-            _float(row, "worst_5_rank_ic_mean", -np.inf),
-            _float(row, "top_10_positive_lift_fold_rate", -np.inf),
-        ),
-        reverse=True,
-    )
-    max_auto = settings.get("max_auto_full_candidates", None)
-    if max_auto is not None:
-        passed_candidates = passed_candidates[: max(0, int(max_auto))]
-
-    for row in passed_candidates:
-        profile = str(row["profile"])
-        if profile not in profiles:
-            profiles.append(profile)
-    return profiles
-
 
 def _comparison_frame(rows: list[dict[str, Any]]) -> pd.DataFrame:
     columns = [
@@ -1421,7 +700,6 @@ def _comparison_frame(rows: list[dict[str, Any]]) -> pd.DataFrame:
             frame[column] = np.nan
     return frame[columns].sort_values(["fold_scope", "mean_rank_ic"], ascending=[True, False]).reset_index(drop=True)
 
-
 def _best_candidate(comparison: pd.DataFrame, control_profile: str) -> dict[str, Any]:
     candidates = comparison[
         (comparison["profile"] != control_profile)
@@ -1435,7 +713,6 @@ def _best_candidate(comparison: pd.DataFrame, control_profile: str) -> dict[str,
         ascending=[False, False, False, False],
     )
     return candidates.iloc[0].to_dict()
-
 
 def _comparison_markdown(comparison: pd.DataFrame, decision: dict[str, Any]) -> str:
     lines = ["# Experiment Profile Comparison", ""]
@@ -1479,13 +756,11 @@ def _comparison_markdown(comparison: pd.DataFrame, decision: dict[str, Any]) -> 
     lines.extend(["", "## Decision", "", json.dumps(_json_ready(decision), indent=2, sort_keys=True)])
     return "\n".join(lines)
 
-
 def _write_decision_files(run_dir: Path, comparison: pd.DataFrame, decision: dict[str, Any]) -> None:
     comparison.to_csv(run_dir / "profile_comparison.csv", index=False)
     (run_dir / "profile_comparison.md").write_text(_comparison_markdown(comparison, decision), encoding="utf-8")
     _write_json(run_dir / "decision_report.json", decision)
     _write_json(run_dir / "best_candidate.json", decision.get("best_candidate") or {})
-
 
 def _experiment_selection_frame(settings: dict[str, Any]) -> pd.DataFrame:
     columns = ["profile", "role", "selected", "expected_fold_scope", "skip_reason"]
@@ -1535,7 +810,6 @@ def _experiment_selection_frame(settings: dict[str, Any]) -> pd.DataFrame:
         return pd.DataFrame(columns=columns)
     return pd.DataFrame(rows, columns=columns).drop_duplicates().reset_index(drop=True)
 
-
 def _experiment_selection_markdown(selection: pd.DataFrame) -> str:
     lines = ["# Experiment Selection", ""]
     if selection.empty:
@@ -1559,7 +833,6 @@ def _experiment_selection_markdown(selection: pd.DataFrame) -> str:
         )
     return "\n".join(lines)
 
-
 def _write_experiment_selection(path: Path, settings: dict[str, Any]) -> pd.DataFrame:
     path.mkdir(parents=True, exist_ok=True)
     selection = _experiment_selection_frame(settings)
@@ -1575,7 +848,6 @@ def _write_experiment_selection(path: Path, settings: dict[str, Any]) -> pd.Data
         },
     )
     return selection
-
 
 def _missing_selected_profiles(selection: pd.DataFrame, comparison: pd.DataFrame) -> pd.DataFrame:
     columns = ["profile", "role", "expected_fold_scope", "reason"]
@@ -1607,7 +879,6 @@ def _missing_selected_profiles(selection: pd.DataFrame, comparison: pd.DataFrame
         )
     return pd.DataFrame(rows, columns=columns)
 
-
 def _missing_selected_markdown(missing: pd.DataFrame) -> str:
     lines = ["# Missing Selected Profiles", ""]
     if missing.empty:
@@ -1630,13 +901,11 @@ def _missing_selected_markdown(missing: pd.DataFrame) -> str:
         )
     return "\n".join(lines)
 
-
 def _write_missing_selected_profiles(path: Path, missing: pd.DataFrame) -> None:
     path.mkdir(parents=True, exist_ok=True)
     missing.to_csv(path / "missing_selected_profiles.csv", index=False)
     (path / "missing_selected_profiles.md").write_text(_missing_selected_markdown(missing), encoding="utf-8")
     _write_json(path / "missing_selected_profiles.json", {"rows": missing.to_dict(orient="records")})
-
 
 def _parquet_timestamps(path: Path) -> pd.Series:
     try:
@@ -1647,7 +916,6 @@ def _parquet_timestamps(path: Path) -> pd.Series:
         return pd.Series(dtype="datetime64[ns, UTC]")
     return pd.to_datetime(frame["timestamp"], utc=True).dropna()
 
-
 def _default_holdout_path(config: dict[str, Any], holdout: dict[str, Any]) -> Path | None:
     explicit = str(holdout.get("holdout_path") or "").strip()
     if explicit:
@@ -1657,7 +925,6 @@ def _default_holdout_path(config: dict[str, Any], holdout: dict[str, Any]) -> Pa
         return None
     filename = str(holdout.get("holdout_filename") or "holdout_1h.parquet")
     return Path(str(data_dir)) / "processed" / filename
-
 
 def _resolve_holdout_settings(settings: dict[str, Any], config: dict[str, Any]) -> dict[str, Any]:
     """Attach durable holdout metadata from config/default Drive paths.
@@ -1706,7 +973,6 @@ def _resolve_holdout_settings(settings: dict[str, Any], config: dict[str, Any]) 
     updated["holdout"] = holdout
     return updated
 
-
 def _holdout_latest_available_data_end(holdout: dict[str, Any]) -> str:
     """Return the latest labeled-data timestamp, not the frozen holdout end.
 
@@ -1721,7 +987,6 @@ def _holdout_latest_available_data_end(holdout: dict[str, Any]) -> str:
             return value
     return ""
 
-
 def _selection_frame_before_holdout(frame: pd.DataFrame, settings: dict[str, Any]) -> pd.DataFrame:
     holdout = settings.get("holdout", {}) or {}
     if not bool(holdout.get("enabled", False)) or "timestamp" not in frame.columns:
@@ -1735,39 +1000,6 @@ def _selection_frame_before_holdout(frame: pd.DataFrame, settings: dict[str, Any
         return frame
     return frame.loc[timestamps < start].copy().reset_index(drop=True)
 
-
-def _holdout_reservation_frame(settings: dict[str, Any]) -> pd.DataFrame:
-    holdout = settings.get("holdout", {}) or {}
-    columns = [
-        "enabled",
-        "holdout_bars",
-        "selection_rows",
-        "holdout_rows",
-        "selection_data_start",
-        "selection_data_end",
-        "holdout_data_start",
-        "holdout_data_end",
-        "holdout_path",
-        "policy",
-        "split_mode",
-        "unused_rows_after_anchor",
-        "anchor_run_id",
-        "anchor_data_end",
-        "latest_available_data_end",
-        "new_bars_since_anchor",
-        "min_new_bars_remaining",
-        "preferred_new_bars_remaining",
-        "future_oos_ready",
-        "future_oos_preferred_ready",
-        "holdout_roll_forward_locked",
-    ]
-    if not holdout:
-        return pd.DataFrame(columns=columns)
-    row = {column: holdout.get(column, "") for column in columns}
-    row["enabled"] = bool(holdout.get("enabled", False))
-    return pd.DataFrame([row], columns=columns)
-
-
 def _holdout_reservation_markdown(frame: pd.DataFrame) -> str:
     lines = ["# Holdout Reservation", ""]
     if frame.empty:
@@ -1780,7 +1012,6 @@ def _holdout_reservation_markdown(frame: pd.DataFrame) -> str:
         lines.append(f"| {key} | {value} |")
     return "\n".join(lines)
 
-
 def _write_holdout_reservation(path: Path, settings: dict[str, Any]) -> pd.DataFrame:
     path.mkdir(parents=True, exist_ok=True)
     frame = _holdout_reservation_frame(settings)
@@ -1788,55 +1019,6 @@ def _write_holdout_reservation(path: Path, settings: dict[str, Any]) -> pd.DataF
     (path / "holdout_reservation.md").write_text(_holdout_reservation_markdown(frame), encoding="utf-8")
     _write_json(path / "holdout_reservation.json", {"rows": frame.to_dict(orient="records")})
     return frame
-
-
-def _future_oos_monitor_state(config: dict[str, Any], latest_data_end: Any) -> dict[str, Any]:
-    policy_review = _cfg(config, ["experiments", "policy_review"], {}) or {}
-    monitor = policy_review.get("future_oos_monitor", {}) or {}
-    status = str(policy_review.get("status", "")).lower()
-    anchor_data_end = str(monitor.get("anchor_data_end", "") or "")
-    latest_text = str(latest_data_end or "")
-    new_bars_since_anchor = 0
-    if anchor_data_end and latest_text:
-        try:
-            anchor_ts = pd.to_datetime(anchor_data_end, utc=True)
-            latest_ts = pd.to_datetime(latest_text, utc=True)
-            if pd.notna(anchor_ts) and pd.notna(latest_ts) and latest_ts > anchor_ts:
-                new_bars_since_anchor = int((latest_ts - anchor_ts).total_seconds() // 3600)
-        except (TypeError, ValueError):
-            new_bars_since_anchor = 0
-
-    min_new_bars = int(monitor.get("min_new_bars", 0) or 0)
-    preferred_new_bars = int(monitor.get("preferred_new_bars", 0) or 0)
-    future_oos_ready = bool(min_new_bars > 0 and new_bars_since_anchor >= min_new_bars)
-    future_oos_preferred_ready = bool(preferred_new_bars > 0 and new_bars_since_anchor >= preferred_new_bars)
-    allow_roll_forward = bool(monitor.get("allow_holdout_roll_forward", False))
-    retired_or_failed = any(token in status for token in ("failed", "invalidated", "retired"))
-    lock_active = bool(monitor.get("enabled", False)) and bool(anchor_data_end) and retired_or_failed and not allow_roll_forward
-    if not bool(monitor.get("enabled", False)):
-        next_action = "monitor_disabled"
-    elif future_oos_ready:
-        next_action = "future_oos_window_available"
-    else:
-        next_action = "wait_for_new_unseen_bars"
-
-    return {
-        "monitor_enabled": bool(monitor.get("enabled", False)),
-        "anchor_run_id": str(monitor.get("anchor_run_id", "")),
-        "anchor_data_end": anchor_data_end,
-        "latest_available_data_end": latest_text,
-        "new_bars_since_anchor": new_bars_since_anchor,
-        "min_new_bars": min_new_bars,
-        "preferred_new_bars": preferred_new_bars,
-        "min_new_bars_remaining": max(0, min_new_bars - new_bars_since_anchor),
-        "preferred_new_bars_remaining": max(0, preferred_new_bars - new_bars_since_anchor),
-        "future_oos_ready": future_oos_ready,
-        "future_oos_preferred_ready": future_oos_preferred_ready,
-        "allow_holdout_roll_forward": allow_roll_forward,
-        "holdout_roll_forward_locked": lock_active,
-        "next_action": next_action,
-    }
-
 
 def _future_oos_ready_at_fields(monitor_state: dict[str, Any]) -> dict[str, str]:
     anchor = str(monitor_state.get("anchor_data_end", "") or "")
@@ -1857,155 +1039,6 @@ def _future_oos_ready_at_fields(monitor_state: dict[str, Any]) -> dict[str, str]
         fields["preferred_ready_at"] = str(anchor_ts + pd.Timedelta(hours=preferred_new_bars))
     return fields
 
-
-def prepare_training_holdout_split(
-    frame: pd.DataFrame,
-    config: dict[str, Any],
-    *,
-    holdout_path: str | Path | None = None,
-) -> tuple[pd.DataFrame, pd.DataFrame, dict[str, Any]]:
-    """Create the training/holdout split without contaminating a failed clean holdout.
-
-    After a clean holdout invalidates a frozen policy, the anchor holdout window
-    must not silently roll forward just because fresher rows exist. Unless the
-    config explicitly allows holdout roll-forward, rows after the anchor end stay
-    unused for training and are counted only as future OOS monitoring bars.
-    """
-
-    if frame.empty or "timestamp" not in frame.columns:
-        raise ValueError("Holdout split requires a non-empty frame with a timestamp column")
-
-    data = frame.copy().reset_index(drop=True)
-    timestamps = pd.to_datetime(data["timestamp"], utc=True)
-    order = np.argsort(timestamps.to_numpy())
-    data = data.iloc[order].reset_index(drop=True)
-    timestamps = pd.to_datetime(data["timestamp"], utc=True)
-
-    holdout_cfg = _cfg(config, ["experiments", "holdout"], {}) or {}
-    holdout_bars = int(holdout_cfg.get("holdout_bars", 4320) or 4320)
-    if len(data) <= holdout_bars:
-        raise ValueError(f"Not enough rows for a {holdout_bars}-bar holdout: {len(data)} rows")
-
-    latest_data_end = str(timestamps.max())
-    monitor_state = _future_oos_monitor_state(config, latest_data_end)
-    split_mode = "rolling_latest_holdout"
-    unused_rows_after_anchor = 0
-    split_data = data
-
-    if monitor_state["holdout_roll_forward_locked"] and monitor_state["anchor_data_end"]:
-        anchor_ts = pd.to_datetime(monitor_state["anchor_data_end"], utc=True)
-        before_or_at_anchor = timestamps <= anchor_ts
-        if before_or_at_anchor.any():
-            split_data = data.loc[before_or_at_anchor].copy().reset_index(drop=True)
-            unused_rows_after_anchor = int((timestamps > anchor_ts).sum())
-            split_mode = "frozen_anchor_holdout"
-
-    if len(split_data) <= holdout_bars:
-        raise ValueError(
-            f"Not enough rows for a {holdout_bars}-bar holdout after applying {split_mode}: {len(split_data)} rows"
-        )
-
-    holdout = split_data.tail(holdout_bars).copy().reset_index(drop=True)
-    selection = split_data.iloc[:-holdout_bars].copy().reset_index(drop=True)
-    if holdout_path is not None:
-        Path(holdout_path).parent.mkdir(parents=True, exist_ok=True)
-        holdout.to_parquet(holdout_path, index=False)
-
-    holdout_ts = pd.to_datetime(holdout["timestamp"], utc=True)
-    selection_ts = pd.to_datetime(selection["timestamp"], utc=True)
-    meta = {
-        "enabled": True,
-        "holdout_bars": holdout_bars,
-        "selection_rows": int(len(selection)),
-        "holdout_rows": int(len(holdout)),
-        "selection_data_start": str(selection_ts.min()),
-        "selection_data_end": str(selection_ts.max()),
-        "holdout_data_start": str(holdout_ts.min()),
-        "holdout_data_end": str(holdout_ts.max()),
-        "holdout_path": str(holdout_path or ""),
-        "policy": str(
-            holdout_cfg.get(
-                "policy",
-                "profile_selection_only_before_holdout; holdout is reserved for one-shot final validation",
-            )
-        ),
-        "split_mode": split_mode,
-        "unused_rows_after_anchor": unused_rows_after_anchor,
-        **monitor_state,
-    }
-    return selection, holdout, meta
-
-
-def _holdout_boundary_audit_frame(entries: list[dict[str, Any]], settings: dict[str, Any]) -> pd.DataFrame:
-    """Verify experiment outputs stop before the reserved holdout window.
-
-    This guards against accidentally diagnosing an old run that was trained before
-    the holdout split existed. If any CV/blend/seed entry reaches into the reserved
-    holdout period, holdout policy decisions must be treated as invalid.
-    """
-
-    columns = [
-        "profile",
-        "fold_scope",
-        "data_start",
-        "data_end",
-        "holdout_data_start",
-        "passed",
-        "reason",
-    ]
-    holdout = settings.get("holdout", {}) or {}
-    if not bool(holdout.get("enabled", False)):
-        return pd.DataFrame(columns=columns)
-
-    holdout_start_raw = holdout.get("holdout_data_start")
-    if not holdout_start_raw:
-        return pd.DataFrame(
-            [
-                {
-                    "profile": "",
-                    "fold_scope": "",
-                    "data_start": "",
-                    "data_end": "",
-                    "holdout_data_start": "",
-                    "passed": False,
-                    "reason": "missing_holdout_data_start",
-                }
-            ],
-            columns=columns,
-        )
-
-    holdout_start = pd.to_datetime(holdout_start_raw, utc=True)
-    rows = []
-    for entry in entries:
-        row = entry.get("diagnostics", {}).get("row", {}) or {}
-        data_start = str(row.get("data_start", ""))
-        data_end = str(row.get("data_end", ""))
-        reason = ""
-        passed = False
-        if not data_end:
-            reason = "missing_entry_data_end"
-        else:
-            try:
-                end_ts = pd.to_datetime(data_end, utc=True)
-                passed = bool(end_ts < holdout_start)
-                if not passed:
-                    reason = "entry_data_end_reaches_reserved_holdout"
-            except (TypeError, ValueError):
-                reason = "invalid_entry_data_end"
-        rows.append(
-            {
-                "profile": str(entry.get("profile", "")),
-                "fold_scope": str(entry.get("fold_scope", "")),
-                "data_start": data_start,
-                "data_end": data_end,
-                "holdout_data_start": str(holdout_start),
-                "passed": passed,
-                "reason": reason,
-            }
-        )
-    return pd.DataFrame(rows, columns=columns)
-
-
 def _write_holdout_boundary_audit(path: Path, audit: pd.DataFrame) -> None:
     path.mkdir(parents=True, exist_ok=True)
     audit.to_csv(path / "holdout_boundary_audit.csv", index=False)
@@ -2014,7 +1047,6 @@ def _write_holdout_boundary_audit(path: Path, audit: pd.DataFrame) -> None:
         encoding="utf-8",
     )
     _write_json(path / "holdout_boundary_audit.json", {"rows": audit.to_dict(orient="records")})
-
 
 def _read_holdout_context(settings: dict[str, Any], config: dict[str, Any]) -> tuple[pd.DataFrame, pd.Timestamp | None]:
     holdout = settings.get("holdout", {}) or {}
@@ -2051,13 +1083,11 @@ def _read_holdout_context(settings: dict[str, Any], config: dict[str, Any]) -> t
         frame = holdout_frame.sort_values("timestamp").reset_index(drop=True)
     return frame, holdout_start
 
-
 def _load_torch_checkpoint(path: Path, device: torch.device) -> dict[str, Any]:
     try:
         return torch.load(path, map_location=device, weights_only=False)
     except TypeError:
         return torch.load(path, map_location=device)
-
 
 def _predict_holdout_for_profile(
     *,
@@ -2114,7 +1144,6 @@ def _predict_holdout_for_profile(
         return pd.DataFrame()
     return pd.concat(rows, ignore_index=True)
 
-
 def _aggregate_holdout_predictions(predictions: pd.DataFrame, *, profile: str) -> pd.DataFrame:
     if predictions.empty:
         return pd.DataFrame()
@@ -2149,7 +1178,6 @@ def _aggregate_holdout_predictions(predictions: pd.DataFrame, *, profile: str) -
     out["source_row_position"] = np.arange(len(out))
     out["profile"] = profile
     return out.sort_values("timestamp").reset_index(drop=True)
-
 
 def _holdout_markdown(holdout_evaluation: pd.DataFrame, holdout_decision: dict[str, Any]) -> str:
     lines = ["# Holdout Evaluation", ""]
@@ -2196,7 +1224,6 @@ def _holdout_markdown(holdout_evaluation: pd.DataFrame, holdout_decision: dict[s
         lines.append("| " + " | ".join(str(row[column]) for column in visible.columns) + " |")
     lines.extend(["", "## Decision", "", json.dumps(_json_ready(holdout_decision), indent=2, sort_keys=True)])
     return "\n".join(lines)
-
 
 def _write_holdout_files(
     path: Path,
@@ -2327,7 +1354,6 @@ def _write_holdout_files(
         },
     )
 
-
 def _holdout_policy_decision_frame(
     holdout_decision: dict[str, Any],
     config: dict[str, Any] | None = None,
@@ -2432,7 +1458,6 @@ def _holdout_policy_decision_frame(
     }
     return pd.DataFrame([row], columns=columns)
 
-
 def _threshold_summary_value(threshold_summary: pd.DataFrame | None, metric: str) -> float:
     if threshold_summary is None or threshold_summary.empty:
         return np.nan
@@ -2445,7 +1470,6 @@ def _threshold_summary_value(threshold_summary: pd.DataFrame | None, metric: str
         return float(matched.iloc[0])
     except (TypeError, ValueError):
         return np.nan
-
 
 def _cv_selected_threshold(entry: dict[str, Any] | None) -> tuple[float, str]:
     if not entry:
@@ -2466,7 +1490,6 @@ def _cv_selected_threshold(entry: dict[str, Any] | None) -> tuple[float, str]:
         return threshold, "cv_selected_threshold"
     return 0.5, "fallback_0.50_missing_cv_threshold"
 
-
 def _binary_metrics_at_threshold(labels: pd.Series, scores: pd.Series, threshold: float) -> dict[str, float]:
     y_true = labels.astype(int).to_numpy()
     y_score = pd.to_numeric(scores, errors="coerce").fillna(-np.inf).to_numpy(dtype=float)
@@ -2484,7 +1507,6 @@ def _binary_metrics_at_threshold(labels: pd.Series, scores: pd.Series, threshold
         "pred_long_rate": float(y_pred.mean()) if len(y_pred) else np.nan,
     }
 
-
 def _attach_holdout_cv_threshold_metrics(
     row: dict[str, Any],
     predictions: pd.DataFrame,
@@ -2500,7 +1522,6 @@ def _attach_holdout_cv_threshold_metrics(
     row["holdout_cv_threshold_pred_long_rate"] = metrics["pred_long_rate"]
     return row
 
-
 def _cv_score_policy(entry: dict[str, Any] | None) -> dict[str, Any]:
     if not entry:
         return {}
@@ -2514,7 +1535,6 @@ def _cv_score_policy(entry: dict[str, Any] | None) -> dict[str, Any]:
         if not chosen.empty:
             return chosen.iloc[0].to_dict()
     return {}
-
 
 def _policy_metrics_from_mask(predictions: pd.DataFrame, mask: pd.Series) -> dict[str, float]:
     selected = predictions.loc[mask].copy()
@@ -2541,7 +1561,6 @@ def _policy_metrics_from_mask(predictions: pd.DataFrame, mask: pd.Series) -> dic
         "lift_vs_base": float(precision / base_long_rate) if base_long_rate and base_long_rate > 0 else np.nan,
         "forward_return": float(selected["forward_return"].mean()) if "forward_return" in selected.columns else np.nan,
     }
-
 
 def _evaluate_score_policy_on_holdout(
     predictions: pd.DataFrame,
@@ -2616,7 +1635,6 @@ def _evaluate_score_policy_on_holdout(
         "reject_reason": ";".join(reasons),
     }
 
-
 def _attach_holdout_policy_metrics(
     row: dict[str, Any],
     predictions: pd.DataFrame,
@@ -2650,7 +1668,6 @@ def _attach_holdout_policy_metrics(
     row["holdout_policy_reject_reason"] = metrics.get("reject_reason", "")
     return row
 
-
 def _attach_holdout_policy_consistency(row: dict[str, Any]) -> dict[str, Any]:
     row["holdout_policy_selection_rate_delta_vs_cv"] = (
         _float(row, "holdout_policy_selection_rate") - _float(row, "cv_policy_selection_rate")
@@ -2681,63 +1698,6 @@ def _attach_holdout_policy_consistency(row: dict[str, Any]) -> dict[str, Any]:
     row["holdout_policy_consistency_pass"] = len(reasons) == 0
     row["holdout_policy_consistency_reject_reason"] = ";".join(reasons)
     return row
-
-
-def _holdout_signal_pass_reasons(row: dict[str, Any], config: dict[str, Any]) -> list[str]:
-    target_rank_ic = float(_cfg(config, ["validation", "target_rank_ic"], 0.03))
-    reasons = []
-    if float(row.get("mean_rank_ic", 0.0)) <= target_rank_ic:
-        reasons.append("mean_rank_ic")
-    if float(row.get("top_10_lift_global", 0.0)) <= 1.0:
-        reasons.append("top_10_lift_global")
-    if float(row.get("top_10_forward_return_global", 0.0)) <= 0.0:
-        reasons.append("top_10_forward_return_global")
-    if not bool(row.get("holdout_policy_pass", False)):
-        reasons.append("holdout_policy")
-    if float(row.get("calibration_separation", 0.0)) <= 0.0:
-        reasons.append("calibration_separation")
-    if not bool(row.get("mtf_leakage_passed", False)):
-        reasons.append("mtf_leakage")
-    if not bool(row.get("stationarity_policy_passed", True)):
-        reasons.append("stationarity_policy")
-    return reasons
-
-
-def _holdout_threshold_pass_reasons(row: dict[str, Any], config: dict[str, Any]) -> list[str]:
-    max_pred_long_rate = float(_cfg(config, ["validation", "threshold_checks", "max_pred_long_rate"], 0.70))
-    min_long_f1 = float(_cfg(config, ["validation", "min_long_f1"], 0.45))
-    reasons = []
-    if float(row.get("holdout_cv_threshold_f1", 0.0)) <= min_long_f1:
-        reasons.append("holdout_cv_threshold_f1")
-    if float(row.get("holdout_cv_threshold_pred_long_rate", 1.0)) > max_pred_long_rate:
-        reasons.append("holdout_cv_threshold_pred_long_rate")
-    return reasons
-
-
-def _attach_holdout_soft_pass(row: dict[str, Any], config: dict[str, Any]) -> dict[str, Any]:
-    signal_reasons = _holdout_signal_pass_reasons(row, config)
-    threshold_reasons = _holdout_threshold_pass_reasons(row, config)
-    reasons = [*signal_reasons, *threshold_reasons]
-    row["holdout_signal_pass"] = len(signal_reasons) == 0
-    row["holdout_signal_reject_reason"] = ";".join(signal_reasons)
-    row["holdout_threshold_pass"] = len(threshold_reasons) == 0
-    row["holdout_threshold_reject_reason"] = ";".join(threshold_reasons)
-    row["holdout_soft_pass"] = len(reasons) == 0
-    row["holdout_reject_reason"] = ";".join(reasons)
-    return row
-
-
-def _rank_ic_for_frame(predictions: pd.DataFrame) -> float:
-    if predictions.empty or "prob_long" not in predictions.columns or "forward_return" not in predictions.columns:
-        return np.nan
-    frame = predictions[["prob_long", "forward_return"]].copy()
-    frame["prob_long"] = pd.to_numeric(frame["prob_long"], errors="coerce")
-    frame["forward_return"] = pd.to_numeric(frame["forward_return"], errors="coerce")
-    frame = frame.dropna()
-    if len(frame) < 3 or frame["prob_long"].nunique() < 2 or frame["forward_return"].nunique() < 2:
-        return np.nan
-    return float(frame["prob_long"].corr(frame["forward_return"], method="spearman"))
-
 
 def _frozen_policy_monitoring_plan_frame(config: dict[str, Any], settings: dict[str, Any]) -> pd.DataFrame:
     policy_review = _cfg(config, ["experiments", "policy_review"], {}) or {}
@@ -2775,7 +1735,6 @@ def _frozen_policy_monitoring_plan_frame(config: dict[str, Any], settings: dict[
     }
     return pd.DataFrame([row])
 
-
 def _write_frozen_policy_monitoring_plan(path: Path, frame: pd.DataFrame) -> None:
     path.mkdir(parents=True, exist_ok=True)
     frame.to_csv(path / "frozen_policy_monitoring_plan.csv", index=False)
@@ -2784,7 +1743,6 @@ def _write_frozen_policy_monitoring_plan(path: Path, frame: pd.DataFrame) -> Non
         encoding="utf-8",
     )
     _write_json(path / "frozen_policy_monitoring_plan.json", {"rows": frame.to_dict(orient="records")})
-
 
 def _experiment_policy_guard_frame(settings: dict[str, Any], config: dict[str, Any]) -> pd.DataFrame:
     guard = copy.deepcopy(settings.get("experiment_policy_guard") or _experiment_policy_guard(settings, config))
@@ -2814,7 +1772,6 @@ def _experiment_policy_guard_frame(settings: dict[str, Any], config: dict[str, A
     }
     return pd.DataFrame([row])
 
-
 def _write_experiment_policy_guard(path: Path, frame: pd.DataFrame) -> None:
     path.mkdir(parents=True, exist_ok=True)
     frame.to_csv(path / "experiment_policy_guard.csv", index=False)
@@ -2824,7 +1781,6 @@ def _write_experiment_policy_guard(path: Path, frame: pd.DataFrame) -> None:
     )
     _write_json(path / "experiment_policy_guard.json", {"rows": frame.to_dict(orient="records")})
 
-
 def _recommendation_with_policy_guard(recommendation: str, settings: dict[str, Any]) -> str:
     guard = settings.get("experiment_policy_guard", {}) or {}
     if bool(guard.get("profile_search_locked", False)) and recommendation not in {
@@ -2833,7 +1789,6 @@ def _recommendation_with_policy_guard(recommendation: str, settings: dict[str, A
     }:
         return str(guard.get("action") or "wait_for_new_unseen_bars_keep_control_profile")
     return recommendation
-
 
 def _future_oos_candidate_plan_frame(
     settings: dict[str, Any],
@@ -3062,7 +2017,6 @@ def _future_oos_candidate_plan_frame(
     out.insert(0, "plan_rank", np.arange(1, len(out) + 1, dtype=int))
     return out.drop(columns=["_stage_order", "_policy_order"])
 
-
 def _write_future_oos_candidate_plan(path: Path, frame: pd.DataFrame) -> None:
     path.mkdir(parents=True, exist_ok=True)
     frame.to_csv(path / "future_oos_candidate_plan.csv", index=False)
@@ -3071,7 +2025,6 @@ def _write_future_oos_candidate_plan(path: Path, frame: pd.DataFrame) -> None:
         encoding="utf-8",
     )
     _write_json(path / "future_oos_candidate_plan.json", {"rows": frame.to_dict(orient="records")})
-
 
 def _performance_gap_reasons(row: dict[str, Any], config: dict[str, Any]) -> str:
     target_rank_ic = float(_cfg(config, ["validation", "target_rank_ic"], 0.03))
@@ -3116,7 +2069,6 @@ def _performance_gap_reasons(row: dict[str, Any], config: dict[str, Any]) -> str
         reasons.append("stationarity_policy")
     return ";".join(reasons)
 
-
 def _holdout_gap_reasons(holdout_row: dict[str, Any], config: dict[str, Any]) -> str:
     if not holdout_row:
         return "missing_holdout_evaluation"
@@ -3143,7 +2095,6 @@ def _holdout_gap_reasons(holdout_row: dict[str, Any], config: dict[str, Any]) ->
         reasons.append("holdout_mtf_leakage")
     return ";".join(dict.fromkeys(reason for reason in reasons if reason))
 
-
 def _performance_gap_action(
     *,
     cv_reasons: str,
@@ -3160,7 +2111,6 @@ def _performance_gap_action(
     if candidate_type == "blend":
         return "candidate_blend_ready_for_predefined_future_oos_review"
     return "candidate_profile_ready_for_predefined_future_oos_review"
-
 
 def _performance_gap_analysis_frame(
     entries: list[dict[str, Any]],
@@ -3311,7 +2261,6 @@ def _performance_gap_analysis_frame(
         .reset_index(drop=True)
     )
 
-
 def _performance_gap_markdown(frame: pd.DataFrame) -> str:
     lines = ["# Performance Gap Analysis", ""]
     if frame.empty:
@@ -3343,20 +2292,17 @@ def _performance_gap_markdown(frame: pd.DataFrame) -> str:
         lines.append("| " + " | ".join(str(row[column]) for column in visible.columns) + " |")
     return "\n".join(lines)
 
-
 def _write_performance_gap_analysis(path: Path, frame: pd.DataFrame) -> None:
     path.mkdir(parents=True, exist_ok=True)
     frame.to_csv(path / "performance_gap_analysis.csv", index=False)
     (path / "performance_gap_analysis.md").write_text(_performance_gap_markdown(frame), encoding="utf-8")
     _write_json(path / "performance_gap_analysis.json", {"rows": frame.to_dict(orient="records")})
 
-
 def _fmt_metric(value: Any, digits: int = 4) -> str:
     number = _optional_float(value)
     if number is None:
         return "NA"
     return f"{number:.{digits}f}"
-
 
 def _first_frame_row(frame: pd.DataFrame, mask: pd.Series | None = None) -> dict[str, Any]:
     if frame.empty:
@@ -3365,7 +2311,6 @@ def _first_frame_row(frame: pd.DataFrame, mask: pd.Series | None = None) -> dict
     if selected.empty:
         return {}
     return selected.iloc[0].to_dict()
-
 
 def _control_comparison_row(comparison: pd.DataFrame, control_profile: str) -> dict[str, Any]:
     if comparison.empty:
@@ -3379,7 +2324,6 @@ def _control_comparison_row(comparison: pd.DataFrame, control_profile: str) -> d
     control_mask = comparison["profile"].astype(str) == str(control_profile)
     return _first_frame_row(comparison, control_mask)
 
-
 def _control_gap_row(performance_gap_analysis: pd.DataFrame, control_profile: str) -> dict[str, Any]:
     if performance_gap_analysis.empty:
         return {}
@@ -3390,7 +2334,6 @@ def _control_gap_row(performance_gap_analysis: pd.DataFrame, control_profile: st
     if row:
         return row
     return _first_frame_row(performance_gap_analysis, performance_gap_analysis["candidate"].astype(str) == str(control_profile))
-
 
 def _phase1_blocker_action_plan_frame(
     *,
@@ -3780,7 +2723,6 @@ def _phase1_blocker_action_plan_frame(
 
     return pd.DataFrame(rows, columns=columns).sort_values("priority").reset_index(drop=True)
 
-
 def _phase1_blocker_action_plan_markdown(frame: pd.DataFrame) -> str:
     lines = ["# Phase 1 Blocker Action Plan", ""]
     if frame.empty:
@@ -3819,7 +2761,6 @@ def _phase1_blocker_action_plan_markdown(frame: pd.DataFrame) -> str:
             lines.append(f"Notes: {row['notes']}")
     return "\n".join(lines)
 
-
 def _write_phase1_blocker_action_plan(path: Path, frame: pd.DataFrame) -> None:
     path.mkdir(parents=True, exist_ok=True)
     frame.to_csv(path / "phase1_blocker_action_plan.csv", index=False)
@@ -3828,92 +2769,6 @@ def _write_phase1_blocker_action_plan(path: Path, frame: pd.DataFrame) -> None:
         encoding="utf-8",
     )
     _write_json(path / "phase1_blocker_action_plan.json", {"rows": frame.to_dict(orient="records")})
-
-
-def _diagnostic_candidate_type(fold_scope: str) -> str:
-    return "blend" if str(fold_scope).startswith("blend_") else "profile"
-
-
-def _is_stability_scope(fold_scope: str) -> bool:
-    fold_scope = str(fold_scope)
-    return fold_scope == "full" or fold_scope.startswith("blend_")
-
-
-def _entry_official_threshold_source(entry: dict[str, Any]) -> str:
-    row = (entry.get("diagnostics", {}) or {}).get("row", {}) or {}
-    return str(row.get("official_threshold_source") or row.get("guarded_threshold_source") or "")
-
-
-def _entry_threshold_policy_frame(entry: dict[str, Any]) -> pd.DataFrame:
-    diagnostics = entry.get("diagnostics", {}) or {}
-    threshold_metrics = diagnostics.get("threshold_metrics")
-    if threshold_metrics is None or threshold_metrics.empty:
-        return pd.DataFrame()
-
-    frame = threshold_metrics.copy()
-    calibrated = diagnostics.get("calibrated_threshold_metrics")
-    if calibrated is not None and not calibrated.empty and "fold" in calibrated.columns:
-        calibrated_keep = [
-            column
-            for column in (
-                "fold",
-                "selected_threshold",
-                "test_f1_at_selected_threshold",
-                "test_precision_at_selected_threshold",
-                "test_recall_at_selected_threshold",
-                "test_pred_long_rate_at_selected_threshold",
-                "constrained_threshold",
-                "source_constrained_f1",
-                "source_constrained_precision",
-                "source_constrained_recall",
-                "source_constrained_pred_long_rate",
-                "test_f1_at_constrained_threshold",
-                "test_precision_at_constrained_threshold",
-                "test_recall_at_constrained_threshold",
-                "test_pred_long_rate_at_constrained_threshold",
-            )
-            if column in calibrated.columns
-        ]
-        calibrated_frame = calibrated[calibrated_keep].rename(
-            columns={column: f"calibrated_{column}" for column in calibrated_keep if column != "fold"}
-        )
-        frame = frame.merge(calibrated_frame, on="fold", how="left")
-
-    source = _entry_official_threshold_source(entry)
-    use_calibrated = source.startswith("calibrated_")
-    source_base = source.replace("calibrated_", "", 1) if use_calibrated else source
-    if "selected" in source_base:
-        family = "selected"
-    elif "constrained" in source_base:
-        family = "constrained"
-    else:
-        family = "constrained"
-        if not source:
-            source = "validation_constrained_threshold"
-    prefix = "calibrated_" if use_calibrated else ""
-
-    metric_map = {
-        "threshold": f"{prefix}{family}_threshold",
-        "f1": f"{prefix}test_f1_at_{family}_threshold",
-        "precision": f"{prefix}test_precision_at_{family}_threshold",
-        "recall": f"{prefix}test_recall_at_{family}_threshold",
-        "pred_rate": f"{prefix}test_pred_long_rate_at_{family}_threshold",
-    }
-
-    def metric_series(column: str) -> pd.Series:
-        if column not in frame.columns:
-            return pd.Series(np.nan, index=frame.index)
-        return pd.to_numeric(frame[column], errors="coerce")
-
-    frame["official_threshold_source"] = source
-    frame["official_threshold_uses_calibration"] = bool(use_calibrated)
-    frame["official_threshold"] = metric_series(metric_map["threshold"])
-    frame["test_f1_at_official_threshold"] = metric_series(metric_map["f1"])
-    frame["test_precision_at_official_threshold"] = metric_series(metric_map["precision"])
-    frame["test_recall_at_official_threshold"] = metric_series(metric_map["recall"])
-    frame["test_pred_long_rate_at_official_threshold"] = metric_series(metric_map["pred_rate"])
-    return frame
-
 
 def _fold_stability_forensics_frame(
     entries: list[dict[str, Any]],
@@ -4093,7 +2948,6 @@ def _fold_stability_forensics_frame(
         .reset_index(drop=True)
     )
 
-
 def _fold_stability_summary_frame(forensics: pd.DataFrame, config: dict[str, Any] | None = None) -> pd.DataFrame:
     columns = [
         "candidate",
@@ -4155,7 +3009,6 @@ def _fold_stability_summary_frame(forensics: pd.DataFrame, config: dict[str, Any
             }
         )
     return pd.DataFrame(rows, columns=columns).sort_values(["candidate_type", "rank_ic_std"], ascending=[True, True]).reset_index(drop=True)
-
 
 def _threshold_forensics_frame(entries: list[dict[str, Any]], config: dict[str, Any]) -> pd.DataFrame:
     columns = [
@@ -4282,7 +3135,6 @@ def _threshold_forensics_frame(entries: list[dict[str, Any]], config: dict[str, 
         .sort_values(["candidate_type", "candidate", "constrained_f1_gap_vs_target"], ascending=[True, True, False])
         .reset_index(drop=True)
     )
-
 
 def _threshold_policy_review_frame(entries: list[dict[str, Any]], config: dict[str, Any]) -> pd.DataFrame:
     columns = [
@@ -4477,7 +3329,6 @@ def _threshold_policy_review_frame(entries: list[dict[str, Any]], config: dict[s
         .reset_index(drop=True)
     )
 
-
 def _threshold_policy_review_markdown(frame: pd.DataFrame) -> str:
     lines = ["# Threshold Policy Review", ""]
     if frame.empty:
@@ -4508,13 +3359,11 @@ def _threshold_policy_review_markdown(frame: pd.DataFrame) -> str:
         lines.append("| " + " | ".join(str(row[column]) for column in visible.columns) + " |")
     return "\n".join(lines)
 
-
 def _write_threshold_policy_review(path: Path, frame: pd.DataFrame) -> None:
     path.mkdir(parents=True, exist_ok=True)
     frame.to_csv(path / "threshold_policy_review.csv", index=False)
     (path / "threshold_policy_review.md").write_text(_threshold_policy_review_markdown(frame), encoding="utf-8")
     _write_json(path / "threshold_policy_review.json", {"rows": frame.to_dict(orient="records")})
-
 
 def _threshold_metrics_at_value(labels: pd.Series, scores: pd.Series, threshold: float) -> dict[str, float]:
     labels_array = labels.astype(int).to_numpy()
@@ -4532,7 +3381,6 @@ def _threshold_metrics_at_value(labels: pd.Series, scores: pd.Series, threshold:
         "recall": float(recall),
         "pred_long_rate": float(predictions.mean()) if len(predictions) else 0.0,
     }
-
 
 def _threshold_selection_stats(frame: pd.DataFrame, threshold: float) -> dict[str, float]:
     if frame.empty or "prob_long" not in frame.columns or "label" not in frame.columns:
@@ -4569,10 +3417,8 @@ def _threshold_selection_stats(frame: pd.DataFrame, threshold: float) -> dict[st
         ),
     }
 
-
 def _regime_columns(frame: pd.DataFrame) -> list[str]:
     return sorted([column for column in frame.columns if str(column).startswith("regime_prob_")])
-
 
 def _with_dominant_regime(frame: pd.DataFrame) -> pd.DataFrame:
     regime_columns = _regime_columns(frame)
@@ -4581,7 +3427,6 @@ def _with_dominant_regime(frame: pd.DataFrame) -> pd.DataFrame:
     out = frame.copy()
     out["dominant_regime"] = out[regime_columns].idxmax(axis=1).str.rsplit("_", n=1).str[-1].astype(int)
     return out
-
 
 def _select_validation_threshold(
     frame: pd.DataFrame,
@@ -4655,7 +3500,6 @@ def _select_validation_threshold(
         "constraint_satisfied": bool(selected["constraint_satisfied"]),
     }
 
-
 def _metrics_for_masked_predictions(frame: pd.DataFrame, predictions: pd.Series) -> dict[str, float]:
     labels = frame["label"].astype(int).to_numpy()
     pred = predictions.astype(bool).to_numpy()
@@ -4688,7 +3532,6 @@ def _metrics_for_masked_predictions(frame: pd.DataFrame, predictions: pd.Series)
             else np.nan
         ),
     }
-
 
 def _regime_threshold_policy_frames(
     entries: list[dict[str, Any]],
@@ -4946,7 +3789,6 @@ def _regime_threshold_policy_frames(
     )
     return by_fold, summary
 
-
 def _regime_threshold_policy_markdown(summary: pd.DataFrame) -> str:
     lines = ["# Regime Threshold Policy Review", ""]
     lines.append(
@@ -4977,7 +3819,6 @@ def _regime_threshold_policy_markdown(summary: pd.DataFrame) -> str:
         lines.append("| " + " | ".join(str(row[column]) for column in visible.columns) + " |")
     return "\n".join(lines)
 
-
 def _write_regime_threshold_policy(path: Path, by_fold: pd.DataFrame, summary: pd.DataFrame) -> None:
     path.mkdir(parents=True, exist_ok=True)
     by_fold.to_csv(path / "regime_threshold_policy_by_fold.csv", index=False)
@@ -4990,7 +3831,6 @@ def _write_regime_threshold_policy(path: Path, by_fold: pd.DataFrame, summary: p
             "regime_threshold_policy_summary": summary.to_dict(orient="records"),
         },
     )
-
 
 def _regime_stability_frames(
     entries: list[dict[str, Any]],
@@ -5184,7 +4024,6 @@ def _regime_stability_frames(
     )
     return forensics, summary
 
-
 def _regime_stability_markdown(summary: pd.DataFrame) -> str:
     lines = ["# Regime Stability Forensics", ""]
     lines.append(
@@ -5214,7 +4053,6 @@ def _regime_stability_markdown(summary: pd.DataFrame) -> str:
         lines.append("| " + " | ".join(str(row[column]) for column in visible.columns) + " |")
     return "\n".join(lines)
 
-
 def _write_regime_stability(path: Path, forensics: pd.DataFrame, summary: pd.DataFrame) -> None:
     path.mkdir(parents=True, exist_ok=True)
     forensics.to_csv(path / "regime_stability_forensics.csv", index=False)
@@ -5228,7 +4066,6 @@ def _write_regime_stability(path: Path, forensics: pd.DataFrame, summary: pd.Dat
         },
     )
 
-
 def _ewma_last(values: list[float], *, alpha: float = 0.35) -> float:
     finite = [float(value) for value in values if np.isfinite(value)]
     if not finite:
@@ -5237,7 +4074,6 @@ def _ewma_last(values: list[float], *, alpha: float = 0.35) -> float:
     for value in finite[1:]:
         state = alpha * value + (1.0 - alpha) * state
     return float(state)
-
 
 def _threshold_transfer_review_frames(
     entries: list[dict[str, Any]],
@@ -5558,7 +4394,6 @@ def _threshold_transfer_review_frames(
     )
     return summary, by_fold
 
-
 def _threshold_transfer_review_markdown(summary: pd.DataFrame, by_fold: pd.DataFrame) -> str:
     lines = ["# Threshold Transfer Review", ""]
     if summary.empty:
@@ -5593,7 +4428,6 @@ def _threshold_transfer_review_markdown(summary: pd.DataFrame, by_fold: pd.DataF
         lines.append(f"By-fold rows: {len(by_fold)}. See `threshold_transfer_by_fold.csv` for fold-level evidence.")
     return "\n".join(lines)
 
-
 def _write_threshold_transfer_review(path: Path, summary: pd.DataFrame, by_fold: pd.DataFrame) -> None:
     path.mkdir(parents=True, exist_ok=True)
     summary.to_csv(path / "threshold_transfer_review.csv", index=False)
@@ -5610,25 +4444,10 @@ def _write_threshold_transfer_review(path: Path, summary: pd.DataFrame, by_fold:
         },
     )
 
-
-def _score_ks_statistic(positive_scores: pd.Series, negative_scores: pd.Series) -> float:
-    pos = pd.to_numeric(positive_scores, errors="coerce").replace([np.inf, -np.inf], np.nan).dropna().to_numpy()
-    neg = pd.to_numeric(negative_scores, errors="coerce").replace([np.inf, -np.inf], np.nan).dropna().to_numpy()
-    if len(pos) == 0 or len(neg) == 0:
-        return np.nan
-    values = np.sort(np.unique(np.concatenate([pos, neg])))
-    pos_sorted = np.sort(pos)
-    neg_sorted = np.sort(neg)
-    pos_cdf = np.searchsorted(pos_sorted, values, side="right") / len(pos_sorted)
-    neg_cdf = np.searchsorted(neg_sorted, values, side="right") / len(neg_sorted)
-    return float(np.max(np.abs(pos_cdf - neg_cdf)))
-
-
 def _score_quantile(part: pd.DataFrame, label_value: int, quantile: float) -> float:
     values = pd.to_numeric(part.loc[part["label"].astype(int) == int(label_value), "prob_long"], errors="coerce")
     values = values.replace([np.inf, -np.inf], np.nan).dropna()
     return float(values.quantile(float(quantile))) if not values.empty else np.nan
-
 
 def _score_separation_forensics_frame(entries: list[dict[str, Any]], config: dict[str, Any]) -> pd.DataFrame:
     columns = [
@@ -5797,13 +4616,11 @@ def _score_separation_forensics_frame(entries: list[dict[str, Any]], config: dic
         .reset_index(drop=True)
     )
 
-
 def _mean_for_mask(frame: pd.DataFrame, mask: pd.Series, column: str) -> float:
     if frame.empty or column not in frame.columns:
         return np.nan
     values = pd.to_numeric(frame.loc[mask, column], errors="coerce")
     return float(values.mean()) if values.notna().any() else np.nan
-
 
 def _bad_fold_signature_frame(score_forensics: pd.DataFrame, config: dict[str, Any]) -> pd.DataFrame:
     columns = [
@@ -5935,7 +4752,6 @@ def _bad_fold_signature_frame(score_forensics: pd.DataFrame, config: dict[str, A
         .reset_index(drop=True)
     )
 
-
 def _score_separation_markdown(score_forensics: pd.DataFrame, bad_signature: pd.DataFrame) -> str:
     lines = ["# Bad Fold Score-Separation Forensics", ""]
     if score_forensics.empty and bad_signature.empty:
@@ -5970,7 +4786,6 @@ def _score_separation_markdown(score_forensics: pd.DataFrame, bad_signature: pd.
         lines.append(f"Fold-level rows: {len(score_forensics)}. See `score_separation_forensics.csv` for detail.")
     return "\n".join(lines)
 
-
 def _write_score_separation_forensics(
     path: Path,
     score_forensics: pd.DataFrame,
@@ -5990,7 +4805,6 @@ def _write_score_separation_forensics(
             "bad_fold_signature": bad_signature.to_dict(orient="records"),
         },
     )
-
 
 def _feature_family(feature: str) -> str:
     name = str(feature)
@@ -6016,7 +4830,6 @@ def _feature_family(feature: str) -> str:
         family = "other"
     return f"{timeframe}_{family}" if timeframe == "4h" else family
 
-
 def _safe_spearman(left: pd.Series, right: pd.Series) -> float:
     frame = pd.DataFrame({"left": left, "right": right}).replace([np.inf, -np.inf], np.nan).dropna()
     if len(frame) < 4:
@@ -6025,7 +4838,6 @@ def _safe_spearman(left: pd.Series, right: pd.Series) -> float:
         return np.nan
     value = frame["left"].corr(frame["right"], method="spearman")
     return float(value) if np.isfinite(value) else np.nan
-
 
 def _label_gap(frame: pd.DataFrame, feature: str) -> float:
     if frame.empty or feature not in frame.columns or "label" not in frame.columns:
@@ -6037,7 +4849,6 @@ def _label_gap(frame: pd.DataFrame, feature: str) -> float:
     if pos.empty or neg.empty:
         return np.nan
     return float(pos.mean() - neg.mean())
-
 
 def _feature_drift_columns() -> list[str]:
     return [
@@ -6070,7 +4881,6 @@ def _feature_drift_columns() -> list[str]:
         "suspect_score",
         "likely_issue",
     ]
-
 
 def _feature_drift_forensics_frame(
     entries: list[dict[str, Any]],
@@ -6237,7 +5047,6 @@ def _feature_drift_forensics_frame(
         .reset_index(drop=True)
     )
 
-
 def _feature_family_drift_summary_frame(feature_drift: pd.DataFrame) -> pd.DataFrame:
     columns = [
         "candidate",
@@ -6302,7 +5111,6 @@ def _feature_family_drift_summary_frame(feature_drift: pd.DataFrame) -> pd.DataF
         .reset_index(drop=True)
     )
 
-
 def _feature_drift_markdown(detail: pd.DataFrame, summary: pd.DataFrame) -> str:
     lines = ["# Bad Fold Feature Drift Forensics", ""]
     if detail.empty and summary.empty:
@@ -6338,7 +5146,6 @@ def _feature_drift_markdown(detail: pd.DataFrame, summary: pd.DataFrame) -> str:
         lines.append(f"Feature-level rows: {len(detail)}. See `feature_drift_forensics.csv` for detail.")
     return "\n".join(lines)
 
-
 def _write_feature_drift_forensics(path: Path, detail: pd.DataFrame, summary: pd.DataFrame) -> None:
     path.mkdir(parents=True, exist_ok=True)
     detail.to_csv(path / "feature_drift_forensics.csv", index=False)
@@ -6355,7 +5162,6 @@ def _write_feature_drift_forensics(path: Path, detail: pd.DataFrame, summary: pd
         },
     )
 
-
 def _clean_probability_inputs(labels: pd.Series, scores: pd.Series) -> pd.DataFrame:
     frame = pd.DataFrame(
         {
@@ -6369,7 +5175,6 @@ def _clean_probability_inputs(labels: pd.Series, scores: pd.Series) -> pd.DataFr
     frame["label"] = frame["label"].astype(int)
     frame["score"] = frame["score"].clip(1e-6, 1.0 - 1e-6)
     return frame
-
 
 def _calibration_error(labels: pd.Series, scores: pd.Series, *, bins: int, strategy: str) -> tuple[float, float, int]:
     frame = _clean_probability_inputs(labels, scores)
@@ -6402,7 +5207,6 @@ def _calibration_error(labels: pd.Series, scores: pd.Series, *, bins: int, strat
         used_bins += 1
     return float(weighted_error), float(max_error), int(used_bins)
 
-
 def _safe_average_precision(labels: pd.Series, scores: pd.Series) -> float:
     frame = _clean_probability_inputs(labels, scores)
     if frame.empty or frame["label"].nunique(dropna=True) < 2:
@@ -6411,7 +5215,6 @@ def _safe_average_precision(labels: pd.Series, scores: pd.Series) -> float:
         return float(average_precision_score(frame["label"], frame["score"]))
     except ValueError:
         return np.nan
-
 
 def _binary_probability_metrics(labels: pd.Series, scores: pd.Series, *, bins: int) -> dict[str, float]:
     frame = _clean_probability_inputs(labels, scores)
@@ -6449,7 +5252,6 @@ def _binary_probability_metrics(labels: pd.Series, scores: pd.Series, *, bins: i
         "prob_long_std": float(scores_array.std(ddof=0)),
         "prob_long_iqr": float(scores_array.quantile(0.75) - scores_array.quantile(0.25)),
     }
-
 
 def _probability_quality_forensics_frame(entries: list[dict[str, Any]], config: dict[str, Any]) -> pd.DataFrame:
     columns = [
@@ -6567,7 +5369,6 @@ def _probability_quality_forensics_frame(entries: list[dict[str, Any]], config: 
         .reset_index(drop=True)
     )
 
-
 def _probability_quality_summary_frame(probability_quality: pd.DataFrame, config: dict[str, Any]) -> pd.DataFrame:
     columns = [
         "candidate",
@@ -6662,7 +5463,6 @@ def _probability_quality_summary_frame(probability_quality: pd.DataFrame, config
         .reset_index(drop=True)
     )
 
-
 def _population_stability_index(actual: pd.Series, expected: pd.Series, *, bins: int) -> float:
     actual_values = pd.to_numeric(actual, errors="coerce").replace([np.inf, -np.inf], np.nan).dropna().to_numpy()
     expected_values = pd.to_numeric(expected, errors="coerce").replace([np.inf, -np.inf], np.nan).dropna().to_numpy()
@@ -6687,7 +5487,6 @@ def _population_stability_index(actual: pd.Series, expected: pd.Series, *, bins:
     actual_pct = np.maximum(actual_counts / max(1, actual_counts.sum()), epsilon)
     expected_pct = np.maximum(expected_counts / max(1, expected_counts.sum()), epsilon)
     return float(np.sum((actual_pct - expected_pct) * np.log(actual_pct / expected_pct)))
-
 
 def _score_distribution_shift_frame(entries: list[dict[str, Any]], config: dict[str, Any]) -> pd.DataFrame:
     columns = [
@@ -6813,7 +5612,6 @@ def _score_distribution_shift_frame(entries: list[dict[str, Any]], config: dict[
         .reset_index(drop=True)
     )
 
-
 def _score_distribution_shift_summary_frame(score_shift: pd.DataFrame, config: dict[str, Any]) -> pd.DataFrame:
     columns = [
         "candidate",
@@ -6888,1160 +5686,6 @@ def _score_distribution_shift_summary_frame(score_shift: pd.DataFrame, config: d
         .sort_values(["candidate_type", "candidate", "max_score_psi"], ascending=[True, True, False])
         .reset_index(drop=True)
     )
-
-
-def _validation_reliability_metrics(part: pd.DataFrame) -> dict[str, float]:
-    if part.empty:
-        return {
-            "val_rank_ic": np.nan,
-            "val_score_gap": np.nan,
-            "val_score_ks": np.nan,
-            "val_average_precision": np.nan,
-            "val_label_long_rate": np.nan,
-            "val_prob_long_std": np.nan,
-            "val_pred_long_rate_050": np.nan,
-        }
-    frame = part.replace([np.inf, -np.inf], np.nan).dropna(subset=["label", "prob_long"]).copy()
-    if frame.empty:
-        return _validation_reliability_metrics(pd.DataFrame())
-    labels = frame["label"].astype(int)
-    scores = pd.to_numeric(frame["prob_long"], errors="coerce")
-    pos_scores = scores.loc[labels == 1]
-    neg_scores = scores.loc[labels == 0]
-    score_gap = (
-        float(pos_scores.mean() - neg_scores.mean())
-        if not pos_scores.empty and not neg_scores.empty
-        else np.nan
-    )
-    if len(labels.unique()) > 1 and scores.nunique(dropna=True) > 1:
-        average_precision = float(average_precision_score(labels, scores))
-    else:
-        average_precision = np.nan
-    return {
-        "val_rank_ic": _rank_ic_for_frame(frame),
-        "val_score_gap": score_gap,
-        "val_score_ks": _score_ks_statistic(pos_scores, neg_scores),
-        "val_average_precision": average_precision,
-        "val_label_long_rate": float(labels.mean()) if len(labels) else np.nan,
-        "val_prob_long_std": float(scores.std(ddof=0)) if scores.notna().any() else np.nan,
-        "val_pred_long_rate_050": float((scores >= 0.5).mean()) if scores.notna().any() else np.nan,
-    }
-
-
-def _reliability_gate_definitions(config: dict[str, Any]) -> list[dict[str, Any]]:
-    cfg = _cfg(config, ["validation", "fold_reliability_gates"], {}) or {}
-    gates = cfg.get("gates", []) or []
-    if gates:
-        return [dict(item) for item in gates if isinstance(item, dict) and str(item.get("name", "")).strip()]
-    return [
-        {"name": "val_rank_ic_positive", "min_val_rank_ic": 0.0},
-        {"name": "val_score_gap_positive", "min_val_score_gap": 0.0},
-        {"name": "val_rank_ic_and_score_gap_positive", "min_val_rank_ic": 0.0, "min_val_score_gap": 0.0},
-        {
-            "name": "val_rank_ic_score_gap_and_ks",
-            "min_val_rank_ic": 0.0,
-            "min_val_score_gap": 0.0,
-            "min_val_score_ks": 0.08,
-        },
-    ]
-
-
-def _gate_threshold_check(metrics: dict[str, float], gate: dict[str, Any], key: str, metric: str) -> bool:
-    if key not in gate:
-        return True
-    value = _float(metrics, metric)
-    threshold = _optional_float(gate.get(key))
-    if threshold is None or not np.isfinite(threshold):
-        return True
-    if not np.isfinite(value):
-        return False
-    if key.startswith("min_"):
-        return value >= threshold
-    if key.startswith("max_"):
-        return value <= threshold
-    return True
-
-
-def _fold_reliability_gate_passed(metrics: dict[str, float], gate: dict[str, Any]) -> bool:
-    checks = [
-        ("min_val_rank_ic", "val_rank_ic"),
-        ("max_val_rank_ic", "val_rank_ic"),
-        ("min_val_score_gap", "val_score_gap"),
-        ("max_val_score_gap", "val_score_gap"),
-        ("min_val_score_ks", "val_score_ks"),
-        ("max_val_score_ks", "val_score_ks"),
-        ("min_val_average_precision", "val_average_precision"),
-        ("max_val_average_precision", "val_average_precision"),
-        ("min_val_prob_long_std", "val_prob_long_std"),
-        ("max_val_prob_long_std", "val_prob_long_std"),
-        ("max_val_pred_long_rate_050", "val_pred_long_rate_050"),
-    ]
-    if "min_val_average_precision_lift_vs_base" in gate:
-        ap = _float(metrics, "val_average_precision")
-        base = _float(metrics, "val_label_long_rate")
-        lift = ap - base if np.isfinite(ap) and np.isfinite(base) else np.nan
-        metrics = {**metrics, "val_average_precision_lift_vs_base": lift}
-        checks.append(("min_val_average_precision_lift_vs_base", "val_average_precision_lift_vs_base"))
-    return all(_gate_threshold_check(metrics, gate, key, metric) for key, metric in checks)
-
-
-def _fold_reliability_gate_frame(entries: list[dict[str, Any]], config: dict[str, Any]) -> pd.DataFrame:
-    columns = [
-        "candidate",
-        "candidate_type",
-        "fold_scope",
-        "gate_name",
-        "fold",
-        "gate_passed",
-        "val_rank_ic",
-        "val_score_gap",
-        "val_score_ks",
-        "val_average_precision",
-        "val_label_long_rate",
-        "val_prob_long_std",
-        "val_pred_long_rate_050",
-        "test_rank_ic",
-        "test_official_f1",
-        "test_official_pred_long_rate",
-        "test_top_10_lift_vs_base",
-        "test_top_10_forward_return",
-    ]
-    cfg = _cfg(config, ["validation", "fold_reliability_gates"], {}) or {}
-    if not bool(cfg.get("enabled", False)):
-        return pd.DataFrame(columns=columns)
-    gates = _reliability_gate_definitions(config)
-    rows: list[dict[str, Any]] = []
-    for entry in entries:
-        fold_scope = str(entry.get("fold_scope", ""))
-        if not _is_stability_scope(fold_scope):
-            continue
-        predictions = entry.get("predictions")
-        if not isinstance(predictions, pd.DataFrame) or predictions.empty:
-            continue
-        if not {"fold", "split", "label", "prob_long", "forward_return"}.issubset(predictions.columns):
-            continue
-        diagnostics = entry.get("diagnostics", {}) or {}
-        fold_metrics = diagnostics.get("fold_metrics")
-        fold_by_id = (
-            {int(row["fold"]): row.to_dict() for _, row in fold_metrics.dropna(subset=["fold"]).iterrows()}
-            if isinstance(fold_metrics, pd.DataFrame) and not fold_metrics.empty and "fold" in fold_metrics.columns
-            else {}
-        )
-        threshold_metrics = _entry_threshold_policy_frame(entry)
-        threshold_by_id = (
-            {int(row["fold"]): row.to_dict() for _, row in threshold_metrics.dropna(subset=["fold"]).iterrows()}
-            if threshold_metrics is not None and not threshold_metrics.empty and "fold" in threshold_metrics.columns
-            else {}
-        )
-        score_bands = diagnostics.get("score_band_by_fold")
-        top10_by_id: dict[int, dict[str, Any]] = {}
-        if isinstance(score_bands, pd.DataFrame) and not score_bands.empty and {"fold", "band"}.issubset(score_bands.columns):
-            top10 = score_bands.loc[score_bands["band"].astype(str) == "top_10"].copy()
-            top10_by_id = {int(row["fold"]): row.to_dict() for _, row in top10.dropna(subset=["fold"]).iterrows()}
-
-        candidate = str(entry.get("profile", ""))
-        candidate_type = _diagnostic_candidate_type(fold_scope)
-        for fold, fold_part in predictions.groupby("fold"):
-            fold_id = int(fold)
-            validation = fold_part.loc[fold_part["split"].astype(str) == "val"].copy()
-            test = fold_part.loc[fold_part["split"].astype(str) == "test"].copy()
-            if validation.empty or test.empty:
-                continue
-            val_metrics = _validation_reliability_metrics(validation)
-            fold_row = fold_by_id.get(fold_id, {})
-            threshold_row = threshold_by_id.get(fold_id, {})
-            top10_row = top10_by_id.get(fold_id, {})
-            for gate in gates:
-                row = {
-                    "candidate": candidate,
-                    "candidate_type": candidate_type,
-                    "fold_scope": fold_scope,
-                    "gate_name": str(gate.get("name", "")),
-                    "fold": fold_id,
-                    "gate_passed": _fold_reliability_gate_passed(dict(val_metrics), gate),
-                    **val_metrics,
-                    "test_rank_ic": _float(fold_row, "rank_ic", _rank_ic_for_frame(test)),
-                    "test_official_f1": _float(
-                        threshold_row,
-                        "test_f1_at_official_threshold",
-                        _float(threshold_row, "test_f1_at_constrained_threshold"),
-                    ),
-                    "test_official_pred_long_rate": _float(
-                        threshold_row,
-                        "test_pred_long_rate_at_official_threshold",
-                        _float(threshold_row, "test_pred_long_rate_at_constrained_threshold"),
-                    ),
-                    "test_top_10_lift_vs_base": _float(top10_row, "lift_vs_base"),
-                    "test_top_10_forward_return": _float(top10_row, "mean_forward_return"),
-                }
-                rows.append(row)
-    if not rows:
-        return pd.DataFrame(columns=columns)
-    return (
-        pd.DataFrame(rows, columns=columns)
-        .sort_values(["candidate_type", "candidate", "fold_scope", "gate_name", "fold"])
-        .reset_index(drop=True)
-    )
-
-
-def _fold_reliability_gate_summary_frame(detail: pd.DataFrame, config: dict[str, Any]) -> pd.DataFrame:
-    columns = [
-        "candidate",
-        "candidate_type",
-        "fold_scope",
-        "gate_name",
-        "fold_count",
-        "accepted_fold_count",
-        "rejected_fold_count",
-        "accepted_fraction",
-        "all_rank_ic_mean",
-        "all_rank_ic_std",
-        "accepted_rank_ic_mean",
-        "accepted_rank_ic_std",
-        "accepted_positive_ic_fraction",
-        "accepted_official_f1_mean",
-        "accepted_top_10_forward_return_mean",
-        "rejected_negative_fold_capture_rate",
-        "false_reject_positive_fold_rate",
-        "accepted_rank_ic_mean_delta",
-        "accepted_rank_ic_std_delta",
-        "accepted_official_f1_delta",
-        "gate_passed_cv",
-        "reject_reason",
-        "next_action",
-    ]
-    if detail.empty:
-        return pd.DataFrame(columns=columns)
-    cfg = _cfg(config, ["validation", "fold_reliability_gates"], {}) or {}
-    min_fraction = float(cfg.get("min_accepted_fraction", 0.50))
-    min_folds = int(cfg.get("min_accepted_folds", 12))
-    min_positive = float(cfg.get("min_positive_ic_fraction", 0.75))
-    max_std = float(cfg.get("max_rank_ic_std", 0.06))
-    min_f1_delta = float(cfg.get("min_official_f1_delta", 0.0))
-    rows: list[dict[str, Any]] = []
-    for (candidate, candidate_type, fold_scope, gate_name), part in detail.groupby(
-        ["candidate", "candidate_type", "fold_scope", "gate_name"],
-        dropna=False,
-    ):
-        rank = pd.to_numeric(part["test_rank_ic"], errors="coerce")
-        passed = part["gate_passed"].astype(bool)
-        accepted = part.loc[passed]
-        rejected = part.loc[~passed]
-        accepted_rank = pd.to_numeric(accepted["test_rank_ic"], errors="coerce")
-        rejected_rank = pd.to_numeric(rejected["test_rank_ic"], errors="coerce")
-        total_negative = int((rank < 0.0).sum())
-        rejected_negative = int((rejected_rank < 0.0).sum())
-        total_positive = int((rank > 0.0).sum())
-        rejected_positive = int((rejected_rank > 0.0).sum())
-        all_f1 = pd.to_numeric(part["test_official_f1"], errors="coerce")
-        accepted_f1 = pd.to_numeric(accepted["test_official_f1"], errors="coerce")
-        all_mean = float(rank.mean()) if rank.notna().any() else np.nan
-        all_std = float(rank.std(ddof=1)) if rank.notna().sum() > 1 else np.nan
-        accepted_mean = float(accepted_rank.mean()) if accepted_rank.notna().any() else np.nan
-        accepted_std = float(accepted_rank.std(ddof=1)) if accepted_rank.notna().sum() > 1 else np.nan
-        f1_delta = (
-            float(accepted_f1.mean() - all_f1.mean())
-            if accepted_f1.notna().any() and all_f1.notna().any()
-            else np.nan
-        )
-        reasons: list[str] = []
-        accepted_count = int(len(accepted))
-        fold_count = int(part["fold"].nunique())
-        accepted_fraction = float(accepted_count / fold_count) if fold_count else 0.0
-        positive_fraction = float((accepted_rank > 0.0).mean()) if accepted_count else np.nan
-        if accepted_count < min_folds:
-            reasons.append("accepted_fold_count")
-        if accepted_fraction < min_fraction:
-            reasons.append("accepted_fraction")
-        if not np.isfinite(positive_fraction) or positive_fraction < min_positive:
-            reasons.append("accepted_positive_ic_fraction")
-        if not np.isfinite(accepted_std) or accepted_std > max_std:
-            reasons.append("accepted_rank_ic_std")
-        if not np.isfinite(f1_delta) or f1_delta < min_f1_delta:
-            reasons.append("accepted_official_f1_delta")
-        if np.isfinite(accepted_std) and np.isfinite(all_std) and accepted_std >= all_std:
-            reasons.append("does_not_reduce_rank_ic_std")
-        reject_reason = ";".join(dict.fromkeys(reasons))
-        if not reject_reason:
-            next_action = "pre_register_reliability_gate_for_future_oos_review"
-        elif "accepted_fold_count" in reject_reason or "accepted_fraction" in reject_reason:
-            next_action = "gate_too_sparse_for_phase1_decision"
-        elif "accepted_rank_ic_std" in reject_reason or "does_not_reduce_rank_ic_std" in reject_reason:
-            next_action = "gate_does_not_reduce_fold_std"
-        else:
-            next_action = "gate_diagnostic_only_do_not_promote"
-        rows.append(
-            {
-                "candidate": candidate,
-                "candidate_type": candidate_type,
-                "fold_scope": fold_scope,
-                "gate_name": gate_name,
-                "fold_count": fold_count,
-                "accepted_fold_count": accepted_count,
-                "rejected_fold_count": int(len(rejected)),
-                "accepted_fraction": accepted_fraction,
-                "all_rank_ic_mean": all_mean,
-                "all_rank_ic_std": all_std,
-                "accepted_rank_ic_mean": accepted_mean,
-                "accepted_rank_ic_std": accepted_std,
-                "accepted_positive_ic_fraction": positive_fraction,
-                "accepted_official_f1_mean": float(accepted_f1.mean()) if accepted_f1.notna().any() else np.nan,
-                "accepted_top_10_forward_return_mean": _numeric_mean(accepted, "test_top_10_forward_return"),
-                "rejected_negative_fold_capture_rate": (
-                    float(rejected_negative / total_negative) if total_negative else np.nan
-                ),
-                "false_reject_positive_fold_rate": (
-                    float(rejected_positive / total_positive) if total_positive else np.nan
-                ),
-                "accepted_rank_ic_mean_delta": (
-                    accepted_mean - all_mean if np.isfinite(accepted_mean) and np.isfinite(all_mean) else np.nan
-                ),
-                "accepted_rank_ic_std_delta": (
-                    accepted_std - all_std if np.isfinite(accepted_std) and np.isfinite(all_std) else np.nan
-                ),
-                "accepted_official_f1_delta": f1_delta,
-                "gate_passed_cv": not bool(reject_reason),
-                "reject_reason": reject_reason,
-                "next_action": next_action,
-            }
-        )
-    return (
-        pd.DataFrame(rows, columns=columns)
-        .sort_values(
-            ["gate_passed_cv", "accepted_rank_ic_std_delta", "accepted_rank_ic_mean_delta"],
-            ascending=[False, True, False],
-        )
-        .reset_index(drop=True)
-    )
-
-
-def _fold_reliability_gate_markdown(summary: pd.DataFrame) -> str:
-    lines = ["# Fold Reliability Gates", ""]
-    lines.append(
-        "These rows test causal validation-fold reliability gates. They are diagnostics only: "
-        "a gate can be considered for future unseen OOS only if it improves CV stability without using holdout feedback."
-    )
-    if summary.empty:
-        lines.append("")
-        lines.append("No fold-reliability gate rows were produced.")
-        return "\n".join(lines)
-    display_cols = [
-        "candidate",
-        "fold_scope",
-        "gate_name",
-        "accepted_fold_count",
-        "accepted_fraction",
-        "accepted_rank_ic_mean",
-        "accepted_rank_ic_std",
-        "accepted_positive_ic_fraction",
-        "accepted_official_f1_mean",
-        "rejected_negative_fold_capture_rate",
-        "gate_passed_cv",
-        "reject_reason",
-        "next_action",
-    ]
-    visible = summary[[column for column in display_cols if column in summary.columns]].copy()
-    lines.append("")
-    lines.append("| " + " | ".join(visible.columns) + " |")
-    lines.append("| " + " | ".join(["---"] * len(visible.columns)) + " |")
-    for _, row in visible.iterrows():
-        lines.append("| " + " | ".join(str(row[column]) for column in visible.columns) + " |")
-    return "\n".join(lines)
-
-
-def _probability_quality_markdown(summary: pd.DataFrame) -> str:
-    lines = ["# Probability Quality Forensics", ""]
-    if summary.empty:
-        lines.append("No probability-quality rows were produced.")
-        return "\n".join(lines)
-    display_cols = [
-        "candidate",
-        "fold_scope",
-        "mean_brier_score",
-        "mean_average_precision",
-        "mean_ece_equal_count",
-        "bad_average_precision_mean",
-        "good_average_precision_mean",
-        "bad_ece_equal_count_mean",
-        "good_ece_equal_count_mean",
-        "probability_quality_issue",
-        "recommended_next_action",
-    ]
-    visible = summary[[column for column in display_cols if column in summary.columns]].copy()
-    lines.append("| " + " | ".join(visible.columns) + " |")
-    lines.append("| " + " | ".join(["---"] * len(visible.columns)) + " |")
-    for _, row in visible.iterrows():
-        lines.append("| " + " | ".join(str(row[column]) for column in visible.columns) + " |")
-    return "\n".join(lines)
-
-
-def _score_distribution_shift_markdown(summary: pd.DataFrame) -> str:
-    lines = ["# Score Distribution Shift", ""]
-    if summary.empty:
-        lines.append("No score-distribution shift rows were produced.")
-        return "\n".join(lines)
-    display_cols = [
-        "candidate",
-        "fold_scope",
-        "mean_score_ks",
-        "max_score_ks",
-        "mean_score_psi",
-        "max_score_psi",
-        "bad_score_psi_mean",
-        "good_score_psi_mean",
-        "high_shift_folds",
-        "score_shift_issue",
-        "recommended_next_action",
-    ]
-    visible = summary[[column for column in display_cols if column in summary.columns]].copy()
-    lines.append("| " + " | ".join(visible.columns) + " |")
-    lines.append("| " + " | ".join(["---"] * len(visible.columns)) + " |")
-    for _, row in visible.iterrows():
-        lines.append("| " + " | ".join(str(row[column]) for column in visible.columns) + " |")
-    return "\n".join(lines)
-
-
-def _write_probability_quality_forensics(path: Path, detail: pd.DataFrame, summary: pd.DataFrame) -> None:
-    path.mkdir(parents=True, exist_ok=True)
-    detail.to_csv(path / "probability_quality_forensics.csv", index=False)
-    summary.to_csv(path / "probability_quality_summary.csv", index=False)
-    (path / "probability_quality_forensics.md").write_text(_probability_quality_markdown(summary), encoding="utf-8")
-    _write_json(
-        path / "probability_quality_forensics.json",
-        {
-            "probability_quality_forensics": detail.to_dict(orient="records"),
-            "probability_quality_summary": summary.to_dict(orient="records"),
-        },
-    )
-
-
-def _write_score_distribution_shift(path: Path, detail: pd.DataFrame, summary: pd.DataFrame) -> None:
-    path.mkdir(parents=True, exist_ok=True)
-    detail.to_csv(path / "score_distribution_shift.csv", index=False)
-    summary.to_csv(path / "score_distribution_shift_summary.csv", index=False)
-    (path / "score_distribution_shift.md").write_text(_score_distribution_shift_markdown(summary), encoding="utf-8")
-    _write_json(
-        path / "score_distribution_shift.json",
-        {
-            "score_distribution_shift": detail.to_dict(orient="records"),
-            "score_distribution_shift_summary": summary.to_dict(orient="records"),
-        },
-    )
-
-
-def _write_fold_reliability_gate(path: Path, detail: pd.DataFrame, summary: pd.DataFrame) -> None:
-    path.mkdir(parents=True, exist_ok=True)
-    detail.to_csv(path / "fold_reliability_gate.csv", index=False)
-    summary.to_csv(path / "fold_reliability_gate_summary.csv", index=False)
-    (path / "fold_reliability_gate.md").write_text(_fold_reliability_gate_markdown(summary), encoding="utf-8")
-    _write_json(
-        path / "fold_reliability_gate.json",
-        {
-            "fold_reliability_gate": detail.to_dict(orient="records"),
-            "fold_reliability_gate_summary": summary.to_dict(orient="records"),
-        },
-    )
-
-
-def _forensics_markdown(title: str, frame: pd.DataFrame) -> str:
-    return _table_markdown(title, frame)
-
-
-def _write_forensics_reports(
-    path: Path,
-    *,
-    fold_stability_forensics: pd.DataFrame,
-    fold_stability_summary: pd.DataFrame,
-    threshold_forensics: pd.DataFrame,
-) -> None:
-    path.mkdir(parents=True, exist_ok=True)
-    reports = [
-        ("fold_stability_forensics", "Fold Stability Forensics", fold_stability_forensics),
-        ("fold_stability_summary", "Fold Stability Summary", fold_stability_summary),
-        ("threshold_forensics", "Threshold Forensics", threshold_forensics),
-    ]
-    for stem, title, frame in reports:
-        frame.to_csv(path / f"{stem}.csv", index=False)
-        (path / f"{stem}.md").write_text(_forensics_markdown(title, frame), encoding="utf-8")
-        _write_json(path / f"{stem}.json", {"rows": frame.to_dict(orient="records")})
-
-
-def _assign_payoff_score_bins(predictions: pd.DataFrame, *, score_column: str, bins: int) -> pd.DataFrame:
-    required = {"label", score_column}
-    if predictions.empty or not required.issubset(predictions.columns):
-        return pd.DataFrame()
-    frame = predictions.copy().replace([np.inf, -np.inf], np.nan).dropna(subset=["label", score_column])
-    if frame.empty:
-        return frame
-    q = max(1, min(int(bins), len(frame)))
-    frame["score_bin"] = pd.qcut(
-        frame[score_column].rank(method="first"),
-        q=q,
-        labels=False,
-        duplicates="drop",
-    )
-    return frame.dropna(subset=["score_bin"]).copy()
-
-
-def _resolve_payoff_score_bands(config: dict[str, Any], actual_bins: int) -> list[dict[str, Any]]:
-    max_bin = max(0, int(actual_bins) - 1)
-    configured = _cfg(config, ["validation", "score_bands"], None)
-    if not configured:
-        configured = [
-            {"name": "top_10", "min_bin": max_bin, "max_bin": max_bin},
-            {"name": "top_20", "min_bin": max(0, int(np.floor(actual_bins * 0.80))), "max_bin": max_bin},
-            {"name": "top_30", "min_bin": max(0, int(np.floor(actual_bins * 0.70))), "max_bin": max_bin},
-            {"name": "upper_half", "min_bin": max(0, int(np.floor(actual_bins * 0.50))), "max_bin": max_bin},
-            {
-                "name": "mid_upper_40_90",
-                "min_bin": max(0, int(np.floor(actual_bins * 0.40))),
-                "max_bin": max(0, max_bin - 1),
-            },
-        ]
-    bands = []
-    for item in configured:
-        name = str(item.get("name", f"bins_{item.get('min_bin')}_{item.get('max_bin')}"))
-        min_bin = min(max(int(item.get("min_bin", max_bin)), 0), max_bin)
-        max_item_bin = min(max(int(item.get("max_bin", max_bin)), 0), max_bin)
-        if min_bin <= max_item_bin:
-            bands.append({"name": name, "min_bin": min_bin, "max_bin": max_item_bin})
-    return bands
-
-
-def _numeric_mean(frame: pd.DataFrame, column: str) -> float:
-    if column not in frame.columns or frame.empty:
-        return np.nan
-    values = pd.to_numeric(frame[column], errors="coerce").replace([np.inf, -np.inf], np.nan).dropna()
-    return float(values.mean()) if not values.empty else np.nan
-
-
-def _hit_rate(frame: pd.DataFrame, hit_type: str) -> float:
-    if "hit_type" not in frame.columns or frame.empty:
-        return np.nan
-    return float(frame["hit_type"].astype(str).eq(hit_type).mean())
-
-
-def _payoff_alignment_blockers(row: dict[str, Any]) -> str:
-    reasons = []
-    if _float(row, "label_lift_vs_base") <= 1.0:
-        reasons.append("label_lift_not_above_base")
-    if _float(row, "mean_forward_return") <= 0.0:
-        reasons.append("forward_return_not_positive")
-    if np.isfinite(_float(row, "mean_tb_return")) and _float(row, "mean_tb_return") <= 0.0:
-        reasons.append("tb_return_not_positive")
-    if np.isfinite(_float(row, "sl_rate_delta_vs_base")) and _float(row, "sl_rate_delta_vs_base") > 0.0:
-        reasons.append("sl_rate_above_base")
-    if _float(row, "selection_rate") <= 0.0:
-        reasons.append("empty_selection")
-    return ";".join(reasons)
-
-
-def _payoff_alignment_action(row: dict[str, Any]) -> str:
-    blockers = str(row.get("payoff_blockers", ""))
-    if not blockers:
-        return "candidate_band_payoff_aligned_monitor_future_oos"
-    if "label_lift_not_above_base" in blockers:
-        return "weak_label_discrimination_do_not_use_band"
-    if "forward_return_not_positive" in blockers or "tb_return_not_positive" in blockers:
-        return "investigate_payoff_mismatch_before_new_profile_search"
-    if "sl_rate_above_base" in blockers:
-        return "inspect_stop_loss_regime_exposure"
-    return "monitor"
-
-
-def _payoff_alignment_rows_for_entry(
-    entry: dict[str, Any],
-    config: dict[str, Any],
-    *,
-    evaluation_scope: str,
-) -> list[dict[str, Any]]:
-    predictions = entry.get("predictions", pd.DataFrame())
-    if not isinstance(predictions, pd.DataFrame) or predictions.empty:
-        return []
-    frame = _test_predictions(predictions)
-    score_bins = int(_cfg(config, ["validation", "score_lift_bins"], _cfg(config, ["validation", "calibration_bins"], 10)))
-    frame = _assign_payoff_score_bins(frame, score_column="prob_long", bins=score_bins)
-    if frame.empty:
-        return []
-
-    actual_bins = int(pd.to_numeric(frame["score_bin"], errors="coerce").max()) + 1
-    bands = _resolve_payoff_score_bands(config, actual_bins)
-    profile = str(entry.get("profile", ""))
-    fold_scope = str(entry.get("fold_scope", ""))
-    candidate_type = "blend" if fold_scope.startswith("blend_") or profile.startswith("blend_") else "profile"
-    base_count = int(len(frame))
-    base_long_rate = float(pd.to_numeric(frame["label"], errors="coerce").mean())
-    base_forward_return = _numeric_mean(frame, "forward_return")
-    base_tb_return = _numeric_mean(frame, "tb_return")
-    base_tp_rate = _hit_rate(frame, "tp")
-    base_sl_rate = _hit_rate(frame, "sl") + _hit_rate(frame, "both_sl_first")
-    base_time_rate = _hit_rate(frame, "time")
-    rows = []
-    for band in bands:
-        part = frame.loc[
-            (pd.to_numeric(frame["score_bin"], errors="coerce") >= int(band["min_bin"]))
-            & (pd.to_numeric(frame["score_bin"], errors="coerce") <= int(band["max_bin"]))
-        ].copy()
-        if part.empty:
-            continue
-        selected_count = int(len(part))
-        selected_long_rate = float(pd.to_numeric(part["label"], errors="coerce").mean())
-        mean_forward_return = _numeric_mean(part, "forward_return")
-        mean_tb_return = _numeric_mean(part, "tb_return")
-        tp_rate = _hit_rate(part, "tp")
-        sl_rate = _hit_rate(part, "sl") + _hit_rate(part, "both_sl_first")
-        time_rate = _hit_rate(part, "time")
-        row = {
-            "candidate": profile,
-            "candidate_type": candidate_type,
-            "evaluation_scope": evaluation_scope,
-            "fold_scope": fold_scope,
-            "band": str(band["name"]),
-            "min_bin": int(band["min_bin"]),
-            "max_bin": int(band["max_bin"]),
-            "base_count": base_count,
-            "selected_count": selected_count,
-            "selection_rate": float(selected_count / base_count) if base_count else np.nan,
-            "mean_prob_long": _numeric_mean(part, "prob_long"),
-            "base_long_rate": base_long_rate,
-            "selected_long_rate": selected_long_rate,
-            "label_lift_vs_base": float(selected_long_rate / base_long_rate) if base_long_rate > 0 else np.nan,
-            "base_forward_return": base_forward_return,
-            "mean_forward_return": mean_forward_return,
-            "forward_return_delta_vs_base": mean_forward_return - base_forward_return,
-            "base_tb_return": base_tb_return,
-            "mean_tb_return": mean_tb_return,
-            "tb_return_delta_vs_base": mean_tb_return - base_tb_return,
-            "base_tp_rate": base_tp_rate,
-            "tp_rate": tp_rate,
-            "tp_rate_delta_vs_base": tp_rate - base_tp_rate,
-            "base_sl_rate": base_sl_rate,
-            "sl_rate": sl_rate,
-            "sl_rate_delta_vs_base": sl_rate - base_sl_rate,
-            "base_time_rate": base_time_rate,
-            "time_rate": time_rate,
-            "time_rate_delta_vs_base": time_rate - base_time_rate,
-            "label_lift_positive_payoff_mismatch": bool(
-                selected_long_rate > base_long_rate and np.isfinite(mean_forward_return) and mean_forward_return <= 0.0
-            ),
-        }
-        row["payoff_blockers"] = _payoff_alignment_blockers(row)
-        row["payoff_alignment_pass"] = not bool(row["payoff_blockers"])
-        row["next_action"] = _payoff_alignment_action(row)
-        rows.append(row)
-    return rows
-
-
-def _payoff_alignment_frame(
-    entries: list[dict[str, Any]],
-    holdout_entries: list[dict[str, Any]],
-    config: dict[str, Any],
-) -> pd.DataFrame:
-    columns = [
-        "candidate",
-        "candidate_type",
-        "evaluation_scope",
-        "fold_scope",
-        "band",
-        "min_bin",
-        "max_bin",
-        "base_count",
-        "selected_count",
-        "selection_rate",
-        "mean_prob_long",
-        "base_long_rate",
-        "selected_long_rate",
-        "label_lift_vs_base",
-        "base_forward_return",
-        "mean_forward_return",
-        "forward_return_delta_vs_base",
-        "base_tb_return",
-        "mean_tb_return",
-        "tb_return_delta_vs_base",
-        "base_tp_rate",
-        "tp_rate",
-        "tp_rate_delta_vs_base",
-        "base_sl_rate",
-        "sl_rate",
-        "sl_rate_delta_vs_base",
-        "base_time_rate",
-        "time_rate",
-        "time_rate_delta_vs_base",
-        "label_lift_positive_payoff_mismatch",
-        "payoff_alignment_pass",
-        "payoff_blockers",
-        "next_action",
-    ]
-    rows: list[dict[str, Any]] = []
-    for entry in entries:
-        fold_scope = str(entry.get("fold_scope", ""))
-        if fold_scope == "full" or fold_scope.startswith("blend_"):
-            rows.extend(_payoff_alignment_rows_for_entry(entry, config, evaluation_scope="cv_test"))
-    for entry in holdout_entries:
-        rows.extend(_payoff_alignment_rows_for_entry(entry, config, evaluation_scope="holdout"))
-    if not rows:
-        return pd.DataFrame(columns=columns)
-    return (
-        pd.DataFrame(rows)
-        .reindex(columns=columns)
-        .sort_values(["evaluation_scope", "candidate_type", "candidate", "min_bin", "max_bin"])
-        .reset_index(drop=True)
-    )
-
-
-def _payoff_alignment_summary_frame(payoff_alignment: pd.DataFrame) -> pd.DataFrame:
-    columns = [
-        "candidate",
-        "candidate_type",
-        "evaluation_scope",
-        "top_10_label_lift_vs_base",
-        "top_10_mean_forward_return",
-        "top_10_mean_tb_return",
-        "top_10_tp_rate",
-        "top_10_sl_rate",
-        "top_10_payoff_alignment_pass",
-        "top_10_payoff_blockers",
-        "best_forward_return_band",
-        "best_forward_return",
-        "best_forward_return_label_lift",
-        "best_lift_band",
-        "best_lift",
-        "best_lift_forward_return",
-        "payoff_aligned_band_count",
-        "payoff_mismatch_band_count",
-        "next_action",
-    ]
-    if payoff_alignment.empty:
-        return pd.DataFrame(columns=columns)
-    rows = []
-    for (candidate, candidate_type, evaluation_scope), part in payoff_alignment.groupby(
-        ["candidate", "candidate_type", "evaluation_scope"],
-        dropna=False,
-    ):
-        part = part.copy()
-        top_10 = part.loc[part["band"].astype(str).eq("top_10")]
-        top = top_10.iloc[0].to_dict() if not top_10.empty else {}
-        best_return = part.sort_values("mean_forward_return", ascending=False).iloc[0].to_dict()
-        best_lift = part.sort_values("label_lift_vs_base", ascending=False).iloc[0].to_dict()
-        mismatch_count = int(part["label_lift_positive_payoff_mismatch"].astype(bool).sum())
-        aligned_count = int(part["payoff_alignment_pass"].astype(bool).sum())
-        if top and bool(top.get("payoff_alignment_pass", False)):
-            action = "top_10_payoff_aligned_monitor_future_oos"
-        elif top and bool(top.get("label_lift_positive_payoff_mismatch", False)):
-            action = "top_10_label_lift_payoff_mismatch_investigate"
-        elif aligned_count > 0:
-            action = "review_non_top10_payoff_aligned_band_before_future_oos"
-        else:
-            action = "no_payoff_aligned_band_do_not_promote"
-        rows.append(
-            {
-                "candidate": str(candidate),
-                "candidate_type": str(candidate_type),
-                "evaluation_scope": str(evaluation_scope),
-                "top_10_label_lift_vs_base": _float(top, "label_lift_vs_base") if top else np.nan,
-                "top_10_mean_forward_return": _float(top, "mean_forward_return") if top else np.nan,
-                "top_10_mean_tb_return": _float(top, "mean_tb_return") if top else np.nan,
-                "top_10_tp_rate": _float(top, "tp_rate") if top else np.nan,
-                "top_10_sl_rate": _float(top, "sl_rate") if top else np.nan,
-                "top_10_payoff_alignment_pass": bool(top.get("payoff_alignment_pass", False)) if top else False,
-                "top_10_payoff_blockers": str(top.get("payoff_blockers", "")) if top else "missing_top_10",
-                "best_forward_return_band": str(best_return.get("band", "")),
-                "best_forward_return": _float(best_return, "mean_forward_return"),
-                "best_forward_return_label_lift": _float(best_return, "label_lift_vs_base"),
-                "best_lift_band": str(best_lift.get("band", "")),
-                "best_lift": _float(best_lift, "label_lift_vs_base"),
-                "best_lift_forward_return": _float(best_lift, "mean_forward_return"),
-                "payoff_aligned_band_count": aligned_count,
-                "payoff_mismatch_band_count": mismatch_count,
-                "next_action": action,
-            }
-        )
-    return (
-        pd.DataFrame(rows)
-        .reindex(columns=columns)
-        .sort_values(["evaluation_scope", "candidate_type", "top_10_mean_forward_return"], ascending=[True, True, False])
-        .reset_index(drop=True)
-    )
-
-
-def _payoff_alignment_markdown(summary: pd.DataFrame, detail: pd.DataFrame) -> str:
-    lines = ["# Payoff Alignment", ""]
-    if summary.empty:
-        lines.append("No payoff alignment rows were produced.")
-        return "\n".join(lines)
-    display_cols = [
-        "candidate",
-        "candidate_type",
-        "evaluation_scope",
-        "top_10_label_lift_vs_base",
-        "top_10_mean_forward_return",
-        "top_10_mean_tb_return",
-        "top_10_tp_rate",
-        "top_10_sl_rate",
-        "top_10_payoff_alignment_pass",
-        "top_10_payoff_blockers",
-        "best_forward_return_band",
-        "best_forward_return",
-        "next_action",
-    ]
-    visible = summary[[column for column in display_cols if column in summary.columns]].copy()
-    lines.append("## Summary")
-    lines.append("")
-    lines.append("| " + " | ".join(visible.columns) + " |")
-    lines.append("| " + " | ".join(["---"] * len(visible.columns)) + " |")
-    for _, row in visible.iterrows():
-        lines.append("| " + " | ".join(str(row[column]) for column in visible.columns) + " |")
-    mismatch = detail.loc[detail.get("label_lift_positive_payoff_mismatch", pd.Series(dtype=bool)).astype(bool)]
-    if not mismatch.empty:
-        lines.extend(["", "## Label Lift / Payoff Mismatches", ""])
-        mismatch_cols = [
-            "candidate",
-            "evaluation_scope",
-            "band",
-            "label_lift_vs_base",
-            "mean_forward_return",
-            "mean_tb_return",
-            "payoff_blockers",
-        ]
-        visible_mismatch = mismatch[[column for column in mismatch_cols if column in mismatch.columns]].copy()
-        lines.append("| " + " | ".join(visible_mismatch.columns) + " |")
-        lines.append("| " + " | ".join(["---"] * len(visible_mismatch.columns)) + " |")
-        for _, row in visible_mismatch.iterrows():
-            lines.append("| " + " | ".join(str(row[column]) for column in visible_mismatch.columns) + " |")
-    return "\n".join(lines)
-
-
-def _write_payoff_alignment(path: Path, detail: pd.DataFrame, summary: pd.DataFrame) -> None:
-    path.mkdir(parents=True, exist_ok=True)
-    detail.to_csv(path / "payoff_alignment.csv", index=False)
-    summary.to_csv(path / "payoff_alignment_summary.csv", index=False)
-    (path / "payoff_alignment.md").write_text(_payoff_alignment_markdown(summary, detail), encoding="utf-8")
-    _write_json(
-        path / "payoff_alignment.json",
-        {
-            "summary": summary.to_dict(orient="records"),
-            "detail": detail.to_dict(orient="records"),
-        },
-    )
-
-
-def _payoff_policy_rows_for_frame(
-    frame: pd.DataFrame,
-    config: dict[str, Any],
-    *,
-    candidate: str,
-    candidate_type: str,
-    evaluation_scope: str,
-    fold_scope: str,
-    fold: int,
-) -> list[dict[str, Any]]:
-    scored = _assign_payoff_score_bins(frame, score_column="prob_long", bins=int(_cfg(config, ["validation", "score_lift_bins"], 10)))
-    if scored.empty:
-        return []
-
-    actual_bins = int(pd.to_numeric(scored["score_bin"], errors="coerce").max()) + 1
-    bands = _resolve_payoff_score_bands(config, actual_bins)
-    base_count = int(len(scored))
-    base_long_rate = float(pd.to_numeric(scored["label"], errors="coerce").mean())
-    base_forward_return = _numeric_mean(scored, "forward_return")
-    base_tb_return = _numeric_mean(scored, "tb_return")
-    base_tp_rate = _hit_rate(scored, "tp")
-    base_sl_rate = _hit_rate(scored, "sl") + _hit_rate(scored, "both_sl_first")
-    base_time_rate = _hit_rate(scored, "time")
-    rows = []
-    for band in bands:
-        part = scored.loc[
-            (pd.to_numeric(scored["score_bin"], errors="coerce") >= int(band["min_bin"]))
-            & (pd.to_numeric(scored["score_bin"], errors="coerce") <= int(band["max_bin"]))
-        ].copy()
-        if part.empty:
-            continue
-        selected_count = int(len(part))
-        selected_long_rate = float(pd.to_numeric(part["label"], errors="coerce").mean())
-        mean_forward_return = _numeric_mean(part, "forward_return")
-        mean_tb_return = _numeric_mean(part, "tb_return")
-        tp_rate = _hit_rate(part, "tp")
-        sl_rate = _hit_rate(part, "sl") + _hit_rate(part, "both_sl_first")
-        time_rate = _hit_rate(part, "time")
-        row = {
-            "candidate": candidate,
-            "candidate_type": candidate_type,
-            "evaluation_scope": evaluation_scope,
-            "fold_scope": fold_scope,
-            "fold": int(fold),
-            "band": str(band["name"]),
-            "min_bin": int(band["min_bin"]),
-            "max_bin": int(band["max_bin"]),
-            "base_count": base_count,
-            "selected_count": selected_count,
-            "selection_rate": float(selected_count / base_count) if base_count else np.nan,
-            "base_long_rate": base_long_rate,
-            "selected_long_rate": selected_long_rate,
-            "label_lift_vs_base": float(selected_long_rate / base_long_rate) if base_long_rate > 0 else np.nan,
-            "base_forward_return": base_forward_return,
-            "mean_forward_return": mean_forward_return,
-            "forward_return_delta_vs_base": mean_forward_return - base_forward_return,
-            "base_tb_return": base_tb_return,
-            "mean_tb_return": mean_tb_return,
-            "tb_return_delta_vs_base": mean_tb_return - base_tb_return,
-            "base_tp_rate": base_tp_rate,
-            "tp_rate": tp_rate,
-            "tp_rate_delta_vs_base": tp_rate - base_tp_rate,
-            "base_sl_rate": base_sl_rate,
-            "sl_rate": sl_rate,
-            "sl_rate_delta_vs_base": sl_rate - base_sl_rate,
-            "base_time_rate": base_time_rate,
-            "time_rate": time_rate,
-            "time_rate_delta_vs_base": time_rate - base_time_rate,
-        }
-        row["payoff_blockers"] = _payoff_alignment_blockers(row)
-        row["payoff_alignment_pass"] = not bool(row["payoff_blockers"])
-        rows.append(row)
-    return rows
-
-
-def _payoff_policy_robustness_frame(
-    entries: list[dict[str, Any]],
-    holdout_entries: list[dict[str, Any]],
-    config: dict[str, Any],
-) -> pd.DataFrame:
-    columns = [
-        "candidate",
-        "candidate_type",
-        "evaluation_scope",
-        "fold_scope",
-        "fold",
-        "band",
-        "min_bin",
-        "max_bin",
-        "base_count",
-        "selected_count",
-        "selection_rate",
-        "base_long_rate",
-        "selected_long_rate",
-        "label_lift_vs_base",
-        "base_forward_return",
-        "mean_forward_return",
-        "forward_return_delta_vs_base",
-        "base_tb_return",
-        "mean_tb_return",
-        "tb_return_delta_vs_base",
-        "base_tp_rate",
-        "tp_rate",
-        "tp_rate_delta_vs_base",
-        "base_sl_rate",
-        "sl_rate",
-        "sl_rate_delta_vs_base",
-        "base_time_rate",
-        "time_rate",
-        "time_rate_delta_vs_base",
-        "payoff_alignment_pass",
-        "payoff_blockers",
-    ]
-    rows = []
-    for entry in entries:
-        fold_scope = str(entry.get("fold_scope", ""))
-        if fold_scope != "full" and not fold_scope.startswith("blend_"):
-            continue
-        predictions = entry.get("predictions", pd.DataFrame())
-        if not isinstance(predictions, pd.DataFrame) or predictions.empty or "fold" not in predictions.columns:
-            continue
-        test_predictions = _test_predictions(predictions)
-        candidate = str(entry.get("profile", ""))
-        candidate_type = "blend" if fold_scope.startswith("blend_") or candidate.startswith("blend_") else "profile"
-        for fold, part in test_predictions.groupby("fold", dropna=False):
-            rows.extend(
-                _payoff_policy_rows_for_frame(
-                    part,
-                    config,
-                    candidate=candidate,
-                    candidate_type=candidate_type,
-                    evaluation_scope="cv_test",
-                    fold_scope=fold_scope,
-                    fold=int(fold),
-                )
-            )
-    for entry in holdout_entries:
-        predictions = entry.get("predictions", pd.DataFrame())
-        if not isinstance(predictions, pd.DataFrame) or predictions.empty:
-            continue
-        candidate = str(entry.get("profile", ""))
-        fold_scope = str(entry.get("fold_scope", ""))
-        candidate_type = "blend" if fold_scope.startswith("blend_") or candidate.startswith("blend_") else "profile"
-        rows.extend(
-            _payoff_policy_rows_for_frame(
-                _test_predictions(predictions),
-                config,
-                candidate=candidate,
-                candidate_type=candidate_type,
-                evaluation_scope="holdout",
-                fold_scope=fold_scope,
-                fold=0,
-            )
-        )
-    if not rows:
-        return pd.DataFrame(columns=columns)
-    return (
-        pd.DataFrame(rows)
-        .reindex(columns=columns)
-        .sort_values(["evaluation_scope", "candidate_type", "candidate", "band", "fold"])
-        .reset_index(drop=True)
-    )
-
-
-def _payoff_policy_reject_reasons(row: dict[str, Any], config: dict[str, Any]) -> str:
-    gates = _cfg(config, ["validation", "payoff_policy_robustness"], {}) or {}
-    reasons = []
-    if _float(row, "mean_label_lift_vs_base") < float(gates.get("min_mean_label_lift_vs_base", 1.05)):
-        reasons.append("mean_label_lift_vs_base")
-    if _float(row, "positive_label_lift_fold_rate") < float(gates.get("min_positive_label_lift_fold_rate", 0.60)):
-        reasons.append("positive_label_lift_fold_rate")
-    if _float(row, "mean_forward_return") <= float(gates.get("min_mean_forward_return", 0.0)):
-        reasons.append("mean_forward_return")
-    if _float(row, "positive_forward_return_fold_rate") < float(gates.get("min_positive_forward_return_fold_rate", 0.60)):
-        reasons.append("positive_forward_return_fold_rate")
-    if _float(row, "mean_tb_return") <= float(gates.get("min_mean_tb_return", 0.0)):
-        reasons.append("mean_tb_return")
-    if _float(row, "positive_tb_return_fold_rate") < float(gates.get("min_positive_tb_return_fold_rate", 0.55)):
-        reasons.append("positive_tb_return_fold_rate")
-    if _float(row, "payoff_alignment_fold_rate") < float(gates.get("min_payoff_alignment_fold_rate", 0.50)):
-        reasons.append("payoff_alignment_fold_rate")
-    if _float(row, "sl_rate_above_base_fold_rate") > float(gates.get("max_sl_rate_above_base_fold_rate", 0.70)):
-        reasons.append("sl_rate_above_base_fold_rate")
-    return ";".join(reasons)
-
-
-def _payoff_policy_robustness_summary_frame(robustness: pd.DataFrame, config: dict[str, Any]) -> pd.DataFrame:
-    columns = [
-        "candidate",
-        "candidate_type",
-        "evaluation_scope",
-        "band",
-        "folds",
-        "mean_selection_rate",
-        "mean_label_lift_vs_base",
-        "positive_label_lift_fold_rate",
-        "mean_forward_return",
-        "positive_forward_return_fold_rate",
-        "mean_tb_return",
-        "positive_tb_return_fold_rate",
-        "mean_tp_rate",
-        "mean_sl_rate",
-        "sl_rate_above_base_fold_rate",
-        "payoff_alignment_fold_rate",
-        "future_oos_policy_candidate",
-        "reject_reason",
-        "next_action",
-    ]
-    if robustness.empty:
-        return pd.DataFrame(columns=columns)
-    rows = []
-    frame = robustness.copy()
-    numeric_columns = [
-        "selection_rate",
-        "label_lift_vs_base",
-        "mean_forward_return",
-        "mean_tb_return",
-        "tp_rate",
-        "sl_rate",
-        "sl_rate_delta_vs_base",
-    ]
-    for column in numeric_columns:
-        frame[column] = pd.to_numeric(frame[column], errors="coerce")
-    for (candidate, candidate_type, evaluation_scope, band), part in frame.groupby(
-        ["candidate", "candidate_type", "evaluation_scope", "band"],
-        dropna=False,
-    ):
-        row = {
-            "candidate": str(candidate),
-            "candidate_type": str(candidate_type),
-            "evaluation_scope": str(evaluation_scope),
-            "band": str(band),
-            "folds": int(part["fold"].nunique()),
-            "mean_selection_rate": float(part["selection_rate"].mean()),
-            "mean_label_lift_vs_base": float(part["label_lift_vs_base"].mean()),
-            "positive_label_lift_fold_rate": float((part["label_lift_vs_base"] > 1.0).mean()),
-            "mean_forward_return": float(part["mean_forward_return"].mean()),
-            "positive_forward_return_fold_rate": float((part["mean_forward_return"] > 0.0).mean()),
-            "mean_tb_return": float(part["mean_tb_return"].mean()),
-            "positive_tb_return_fold_rate": float((part["mean_tb_return"] > 0.0).mean()),
-            "mean_tp_rate": float(part["tp_rate"].mean()),
-            "mean_sl_rate": float(part["sl_rate"].mean()),
-            "sl_rate_above_base_fold_rate": float((part["sl_rate_delta_vs_base"] > 0.0).mean()),
-            "payoff_alignment_fold_rate": float(part["payoff_alignment_pass"].astype(bool).mean()),
-        }
-        reject_reason = _payoff_policy_reject_reasons(row, config)
-        row["future_oos_policy_candidate"] = bool(str(evaluation_scope) == "cv_test" and not reject_reason)
-        row["reject_reason"] = reject_reason
-        if str(evaluation_scope) == "holdout":
-            row["next_action"] = "diagnostic_only_do_not_select_from_current_holdout"
-        elif row["future_oos_policy_candidate"]:
-            row["next_action"] = "pre_register_for_future_oos_review"
-        elif "mean_forward_return" in reject_reason or "mean_tb_return" in reject_reason:
-            row["next_action"] = "payoff_not_robust_do_not_pre_register"
-        else:
-            row["next_action"] = "monitor_not_pre_registered"
-        rows.append(row)
-    if not rows:
-        return pd.DataFrame(columns=columns)
-    return (
-        pd.DataFrame(rows)
-        .reindex(columns=columns)
-        .sort_values(
-            ["evaluation_scope", "future_oos_policy_candidate", "mean_forward_return", "mean_label_lift_vs_base"],
-            ascending=[True, False, False, False],
-        )
-        .reset_index(drop=True)
-    )
-
-
-def _payoff_policy_robustness_markdown(summary: pd.DataFrame) -> str:
-    lines = ["# Payoff Policy Robustness", ""]
-    if summary.empty:
-        lines.append("No score-band payoff policy robustness rows were produced.")
-        return "\n".join(lines)
-    display_cols = [
-        "candidate",
-        "evaluation_scope",
-        "band",
-        "folds",
-        "mean_label_lift_vs_base",
-        "positive_label_lift_fold_rate",
-        "mean_forward_return",
-        "positive_forward_return_fold_rate",
-        "mean_tb_return",
-        "positive_tb_return_fold_rate",
-        "mean_sl_rate",
-        "sl_rate_above_base_fold_rate",
-        "payoff_alignment_fold_rate",
-        "future_oos_policy_candidate",
-        "reject_reason",
-        "next_action",
-    ]
-    visible = summary[[column for column in display_cols if column in summary.columns]].copy()
-    lines.append("| " + " | ".join(visible.columns) + " |")
-    lines.append("| " + " | ".join(["---"] * len(visible.columns)) + " |")
-    for _, row in visible.iterrows():
-        lines.append("| " + " | ".join(str(row[column]) for column in visible.columns) + " |")
-    return "\n".join(lines)
-
-
-def _write_payoff_policy_robustness(path: Path, detail: pd.DataFrame, summary: pd.DataFrame) -> None:
-    path.mkdir(parents=True, exist_ok=True)
-    detail.to_csv(path / "payoff_policy_robustness.csv", index=False)
-    summary.to_csv(path / "payoff_policy_robustness_summary.csv", index=False)
-    (path / "payoff_policy_robustness.md").write_text(
-        _payoff_policy_robustness_markdown(summary),
-        encoding="utf-8",
-    )
-    _write_json(
-        path / "payoff_policy_robustness.json",
-        {
-            "summary": summary.to_dict(orient="records"),
-            "detail": detail.to_dict(orient="records"),
-        },
-    )
-
 
 def _frozen_policy_robustness_frame(entries: list[dict[str, Any]], config: dict[str, Any]) -> pd.DataFrame:
     policy_review = _cfg(config, ["experiments", "policy_review"], {}) or {}
@@ -8220,17 +5864,6 @@ def _frozen_policy_robustness_frame(entries: list[dict[str, Any]], config: dict[
             }
         )
     return pd.DataFrame(rows, columns=columns)
-
-
-def _write_frozen_policy_robustness(path: Path, frame: pd.DataFrame) -> None:
-    path.mkdir(parents=True, exist_ok=True)
-    frame.to_csv(path / "frozen_policy_robustness.csv", index=False)
-    (path / "frozen_policy_robustness.md").write_text(
-        _table_markdown("Frozen Policy Robustness", frame),
-        encoding="utf-8",
-    )
-    _write_json(path / "frozen_policy_robustness.json", {"rows": frame.to_dict(orient="records")})
-
 
 def _evaluate_holdout_candidates(
     *,
@@ -8461,7 +6094,6 @@ def _evaluate_holdout_candidates(
     )
     return holdout_evaluation, holdout_score_bands, holdout_thresholds, holdout_decision, holdout_entries
 
-
 def _fold_delta_frame(entry: dict[str, Any]) -> pd.DataFrame:
     diagnostics = entry["diagnostics"]
     fold_metrics = diagnostics["fold_metrics"].copy()
@@ -8487,7 +6119,6 @@ def _fold_delta_frame(entry: dict[str, Any]) -> pd.DataFrame:
         ]
         frame = frame.merge(thresholds[merge_columns], on="fold", how="left")
     return frame
-
 
 def _profile_delta_vs_control(entries: list[dict[str, Any]], control_profile: str) -> pd.DataFrame:
     columns = [
@@ -8567,16 +6198,8 @@ def _profile_delta_vs_control(entries: list[dict[str, Any]], control_profile: st
         return pd.DataFrame(columns=columns)
     return pd.DataFrame(rows, columns=columns).sort_values(["fold_scope", "profile", "fold"]).reset_index(drop=True)
 
-
-def _write_profile_delta(path: Path, profile_delta: pd.DataFrame | None) -> None:
-    if profile_delta is None:
-        return
-    profile_delta.to_csv(path / "profile_delta_vs_control.csv", index=False)
-
-
 def _seed_audit_scope(seed: int) -> str:
     return f"seed_audit_seed_{int(seed):03d}"
-
 
 def _seed_audit_entries_to_frames(entries: list[dict[str, Any]]) -> tuple[pd.DataFrame, pd.DataFrame]:
     rows = []
@@ -8595,7 +6218,6 @@ def _seed_audit_entries_to_frames(entries: list[dict[str, Any]]) -> tuple[pd.Dat
         rows.append(row)
     seed_audit = pd.DataFrame(rows).sort_values(["profile", "seed"]).reset_index(drop=True) if rows else pd.DataFrame()
     return seed_audit, _seed_stability_frame(seed_audit)
-
 
 def _seed_stability_frame(seed_audit: pd.DataFrame) -> pd.DataFrame:
     columns = [
@@ -8657,52 +6279,6 @@ def _seed_stability_frame(seed_audit: pd.DataFrame) -> pd.DataFrame:
     )
     return grouped[columns].reset_index(drop=True)
 
-
-def _seed_audit_markdown(seed_audit: pd.DataFrame, seed_stability: pd.DataFrame) -> str:
-    lines = ["# Seed Audit", ""]
-    if seed_audit.empty:
-        lines.append("Seed audit was disabled or produced no completed runs.")
-    else:
-        display_cols = [
-            "profile",
-            "seed",
-            "fold_count",
-            "mean_rank_ic",
-            "std_rank_ic",
-            "positive_ic_fraction",
-            "top_10_lift_global",
-            "test_f1_at_selected_threshold",
-            "test_f1_at_constrained_threshold",
-            "test_pred_long_rate_at_constrained_threshold",
-            "worst_5_rank_ic_mean",
-        ]
-        lines.extend(["## Per Seed", ""])
-        visible = seed_audit[[column for column in display_cols if column in seed_audit.columns]].copy()
-        lines.append("| " + " | ".join(visible.columns) + " |")
-        lines.append("| " + " | ".join(["---"] * len(visible.columns)) + " |")
-        for _, row in visible.iterrows():
-            lines.append("| " + " | ".join(str(row[column]) for column in visible.columns) + " |")
-
-    lines.extend(["", "## Stability", ""])
-    if seed_stability.empty:
-        lines.append("No stability summary available.")
-    else:
-        lines.append("| " + " | ".join(seed_stability.columns) + " |")
-        lines.append("| " + " | ".join(["---"] * len(seed_stability.columns)) + " |")
-        for _, row in seed_stability.iterrows():
-            lines.append("| " + " | ".join(str(row[column]) for column in seed_stability.columns) + " |")
-    return "\n".join(lines)
-
-
-def _write_seed_audit_files(path: Path, seed_audit: pd.DataFrame, seed_stability: pd.DataFrame) -> None:
-    path.mkdir(parents=True, exist_ok=True)
-    seed_audit.to_csv(path / "seed_audit.csv", index=False)
-    seed_stability.to_csv(path / "seed_stability.csv", index=False)
-    (path / "seed_audit.md").write_text(_seed_audit_markdown(seed_audit, seed_stability), encoding="utf-8")
-    _write_json(path / "seed_audit.json", {"rows": seed_audit.to_dict(orient="records")})
-    _write_json(path / "seed_stability.json", {"rows": seed_stability.to_dict(orient="records")})
-
-
 def _seed_from_scope(fold_scope: str) -> int | None:
     if not fold_scope.startswith("seed_audit_seed_"):
         return None
@@ -8711,7 +6287,6 @@ def _seed_from_scope(fold_scope: str) -> int | None:
         return int(seed_text)
     except ValueError:
         return None
-
 
 def _seed_ensemble_predictions(seed_entries: list[dict[str, Any]]) -> pd.DataFrame:
     if len(seed_entries) < 2:
@@ -8768,7 +6343,6 @@ def _seed_ensemble_predictions(seed_entries: list[dict[str, Any]]) -> pd.DataFra
     base["ensemble_seeds"] = ",".join(str(seed) for seed in sorted(set(seeds)))
     return base.sort_values(key_columns).reset_index(drop=True)
 
-
 def _seed_ensemble_entries(entries: list[dict[str, Any]], config: dict[str, Any]) -> list[dict[str, Any]]:
     grouped: dict[str, list[dict[str, Any]]] = {}
     for entry in entries:
@@ -8802,7 +6376,6 @@ def _seed_ensemble_entries(entries: list[dict[str, Any]], config: dict[str, Any]
         )
     return ensemble_entries
 
-
 def _seed_ensemble_frame(entries: list[dict[str, Any]]) -> pd.DataFrame:
     rows = []
     for entry in entries:
@@ -8817,711 +6390,6 @@ def _seed_ensemble_frame(entries: list[dict[str, Any]]) -> pd.DataFrame:
             row["ensemble_seeds"] = str(predictions["ensemble_seeds"].iloc[0]) if "ensemble_seeds" in predictions.columns else ""
         rows.append(row)
     return pd.DataFrame(rows).reset_index(drop=True) if rows else pd.DataFrame()
-
-
-def _seed_ensemble_markdown(seed_ensemble: pd.DataFrame) -> str:
-    lines = ["# Seed Ensemble", ""]
-    if seed_ensemble.empty:
-        lines.append("No seed ensemble was produced.")
-        return "\n".join(lines)
-    display_cols = [
-        "profile",
-        "fold_scope",
-        "seed_count",
-        "fold_count",
-        "mean_rank_ic",
-        "std_rank_ic",
-        "positive_ic_fraction",
-        "top_10_lift_global",
-        "test_f1_at_selected_threshold",
-        "test_f1_at_constrained_threshold",
-        "test_pred_long_rate_at_constrained_threshold",
-        "prob_long_seed_std_mean",
-        "prob_long_seed_std_p90",
-    ]
-    visible = seed_ensemble[[column for column in display_cols if column in seed_ensemble.columns]].copy()
-    lines.append("| " + " | ".join(visible.columns) + " |")
-    lines.append("| " + " | ".join(["---"] * len(visible.columns)) + " |")
-    for _, row in visible.iterrows():
-        lines.append("| " + " | ".join(str(row[column]) for column in visible.columns) + " |")
-    return "\n".join(lines)
-
-
-def _write_seed_ensemble_files(path: Path, seed_ensemble: pd.DataFrame) -> None:
-    path.mkdir(parents=True, exist_ok=True)
-    seed_ensemble.to_csv(path / "seed_ensemble.csv", index=False)
-    (path / "seed_ensemble.md").write_text(_seed_ensemble_markdown(seed_ensemble), encoding="utf-8")
-    _write_json(path / "seed_ensemble.json", {"rows": seed_ensemble.to_dict(orient="records")})
-
-
-def _prediction_key_columns(frame: pd.DataFrame) -> list[str]:
-    keys = []
-    if "split" in frame.columns:
-        keys.append("split")
-    for column in ("fold", "timestamp", "source_row_position"):
-        if column in frame.columns:
-            keys.append(column)
-    return keys
-
-
-def _rank_score_by_fold(frame: pd.DataFrame) -> pd.Series:
-    group_keys = [column for column in ("split", "fold") if column in frame.columns]
-    if not group_keys:
-        return frame["prob_long"].rank(method="average", pct=True)
-    return frame.groupby(group_keys, dropna=False)["prob_long"].rank(method="average", pct=True)
-
-
-def _profile_blend_predictions(
-    entries: list[dict[str, Any]],
-    *,
-    method: str,
-    weights: list[float] | None = None,
-) -> pd.DataFrame:
-    if len(entries) < 2:
-        return pd.DataFrame()
-
-    normalized_weights: list[float] | None = None
-    if weights is not None:
-        if len(weights) != len(entries):
-            raise ValueError("Blend weights must match the number of profile entries")
-        raw_weights = np.asarray(weights, dtype=float)
-        if not np.isfinite(raw_weights).all() or (raw_weights < 0).any() or raw_weights.sum() <= 0:
-            raise ValueError("Blend weights must be finite non-negative values with a positive sum")
-        normalized_weights = (raw_weights / raw_weights.sum()).tolist()
-
-    frames = []
-    profiles = []
-    for idx, entry in enumerate(entries):
-        prediction = entry["predictions"].copy()
-        profile = str(entry["profile"])
-        prediction["_blend_profile"] = profile
-        prediction["_blend_weight"] = 1.0 if normalized_weights is None else float(normalized_weights[idx])
-        if method in {"rank_mean", "rank_weighted"}:
-            prediction["_blend_score"] = _rank_score_by_fold(prediction)
-        elif method in {"prob_mean", "prob_weighted"}:
-            prediction["_blend_score"] = prediction["prob_long"].astype(float)
-        else:
-            raise ValueError(f"Unknown profile blend method: {method}")
-        prediction["_blend_weighted_score"] = prediction["_blend_score"] * prediction["_blend_weight"]
-        frames.append(prediction)
-        profiles.append(profile)
-    if len(frames) < 2:
-        return pd.DataFrame()
-
-    stacked = pd.concat(frames, ignore_index=True)
-    key_columns = _prediction_key_columns(stacked)
-    if not {"fold", "timestamp"}.issubset(key_columns):
-        return pd.DataFrame()
-
-    profile_count = len(set(profiles))
-    grouped = stacked.groupby(key_columns, dropna=False)
-    if normalized_weights is None:
-        stats = grouped["_blend_score"].agg(
-            prob_long_blend="mean",
-            prob_long_profile_std="std",
-            prob_long_profile_min="min",
-            prob_long_profile_max="max",
-            blend_profile_count="count",
-        ).reset_index()
-    else:
-        stats = grouped.agg(
-            prob_long_blend=("_blend_weighted_score", "sum"),
-            prob_long_profile_std=("_blend_score", "std"),
-            prob_long_profile_min=("_blend_score", "min"),
-            prob_long_profile_max=("_blend_score", "max"),
-            blend_profile_count=("_blend_score", "count"),
-        ).reset_index()
-    stats = stats.loc[stats["blend_profile_count"] == profile_count].copy()
-    if stats.empty:
-        return pd.DataFrame()
-
-    base = grouped.first().reset_index()
-    drop_columns = ["_blend_profile", "_blend_score", "_blend_weight", "_blend_weighted_score", "prob_long_blend"]
-    base = base.drop(columns=[column for column in drop_columns if column in base.columns], errors="ignore")
-    base = base.merge(stats, on=key_columns, how="inner")
-    base["prob_long"] = base["prob_long_blend"]
-    regime_columns = [column for column in stacked.columns if column.startswith("regime_prob_")]
-    if regime_columns:
-        regime_avg = grouped[regime_columns].mean().reset_index()
-        base = base.drop(columns=[column for column in regime_columns if column in base.columns]).merge(
-            regime_avg,
-            on=key_columns,
-            how="left",
-        )
-    base = base.drop(columns=["prob_long_blend"], errors="ignore")
-    base["blend_method"] = method
-    base["blend_profiles"] = ",".join(profiles)
-    if normalized_weights is not None:
-        base["blend_weights"] = ",".join(f"{weight:.6g}" for weight in normalized_weights)
-    return base.sort_values(key_columns).reset_index(drop=True)
-
-
-def _blend_entry_config(config: dict[str, Any], profile: str, feature_columns: list[str], *, description: str) -> dict[str, Any]:
-    blend_cfg = copy.deepcopy(config)
-    profiles = copy.deepcopy(_cfg(blend_cfg, ["features", "profiles"], {}) or {})
-    profiles[profile] = {
-        "description": description,
-        "include_patterns": list(feature_columns),
-        "exclude_patterns": [],
-    }
-    _set_cfg(blend_cfg, ["features", "profiles"], profiles)
-    return blend_cfg
-
-
-def _profile_blend_entries(entries: list[dict[str, Any]], config: dict[str, Any]) -> list[dict[str, Any]]:
-    full_entries = [
-        entry
-        for entry in entries
-        if str(entry.get("fold_scope", "")) == "full"
-        and not str(entry.get("profile", "")).startswith("blend_")
-    ]
-    if len(full_entries) < 2:
-        return []
-
-    blend_settings = _cfg(config, ["experiments", "profile_blends"], {}) or {}
-    include_auto_equal = bool(blend_settings.get("include_auto_equal_weight", True))
-    include_auto_rank = bool(blend_settings.get("include_auto_rank_mean", True))
-    blend_entries = []
-    entry_by_profile = {str(entry["profile"]): entry for entry in full_entries}
-
-    def append_blend(
-        combo: list[dict[str, Any]],
-        *,
-        method: str,
-        weights: list[float] | None = None,
-        name: str | None = None,
-        description: str | None = None,
-    ) -> None:
-        profiles = [str(entry["profile"]) for entry in combo]
-        feature_columns = sorted({column for entry in combo for column in entry.get("feature_columns", [])})
-        combo_hash = _hash_payload({"profiles": profiles, "method": method, "weights": weights})[:10]
-        predictions = _profile_blend_predictions(combo, method=method, weights=weights)
-        if predictions.empty:
-            return
-        profile = _slug(name) if name else f"blend_{method}_{combo_hash}"
-        if not profile.startswith("blend_"):
-            profile = f"blend_{profile}"
-        blend_cfg = _blend_entry_config(
-            config,
-            profile,
-            feature_columns,
-            description=description or f"Diagnostic {method} blend of: {', '.join(profiles)}",
-        )
-        diagnostics = summarize_profile_predictions(
-            predictions,
-            blend_cfg,
-            profile=profile,
-            feature_columns=feature_columns,
-            fold_scope=f"blend_{method}",
-        )
-        diagnostics["row"]["blend_profiles"] = ",".join(profiles)
-        diagnostics["row"]["blend_method"] = method
-        diagnostics["row"]["profile_count"] = len(profiles)
-        if weights is not None:
-            raw_weights = np.asarray(weights, dtype=float)
-            normalized = raw_weights / raw_weights.sum()
-            diagnostics["row"]["blend_weights"] = ",".join(f"{weight:.6g}" for weight in normalized)
-        diagnostics["row"]["prob_long_profile_std_mean"] = float(
-            pd.to_numeric(predictions["prob_long_profile_std"], errors="coerce").mean()
-        )
-        diagnostics["row"]["prob_long_profile_std_p90"] = float(
-            pd.to_numeric(predictions["prob_long_profile_std"], errors="coerce").quantile(0.90)
-        )
-        blend_entries.append(
-            {
-                "profile": profile,
-                "fold_scope": f"blend_{method}",
-                "feature_columns": feature_columns,
-                "predictions": predictions,
-                "diagnostics": diagnostics,
-                "summary": diagnostics["row"],
-                "config": blend_cfg,
-            }
-        )
-
-    if include_auto_equal:
-        combos = list(combinations(full_entries, 2))
-        if len(full_entries) > 2:
-            combos.append(tuple(full_entries))
-        for combo in combos:
-            methods = ["prob_mean"]
-            if include_auto_rank:
-                methods.append("rank_mean")
-            for method in methods:
-                append_blend(list(combo), method=method)
-
-    for spec in blend_settings.get("weighted", []) or []:
-        if not isinstance(spec, dict) or not bool(spec.get("enabled", True)):
-            continue
-        profiles = [str(profile) for profile in spec.get("profiles", []) or []]
-        if len(profiles) < 2:
-            continue
-        if any(profile not in entry_by_profile for profile in profiles):
-            continue
-        method = str(spec.get("method", "prob_weighted"))
-        weights = [float(weight) for weight in spec.get("weights", []) or []]
-        append_blend(
-            [entry_by_profile[profile] for profile in profiles],
-            method=method,
-            weights=weights,
-            name=str(spec.get("name", "")) or None,
-            description=str(spec.get("description", "")) or None,
-        )
-    return blend_entries
-
-
-def _profile_blend_frame(entries: list[dict[str, Any]]) -> pd.DataFrame:
-    rows = []
-    for entry in entries:
-        if not str(entry.get("fold_scope", "")).startswith("blend_"):
-            continue
-        row = dict(entry["diagnostics"]["row"])
-        predictions = entry.get("predictions", pd.DataFrame())
-        if isinstance(predictions, pd.DataFrame) and not predictions.empty:
-            row["blend_profiles"] = str(predictions["blend_profiles"].iloc[0]) if "blend_profiles" in predictions.columns else row.get("blend_profiles", "")
-            row["blend_method"] = str(predictions["blend_method"].iloc[0]) if "blend_method" in predictions.columns else row.get("blend_method", "")
-            row["blend_weights"] = str(predictions["blend_weights"].iloc[0]) if "blend_weights" in predictions.columns else row.get("blend_weights", "")
-            row["profile_count"] = int(predictions["blend_profile_count"].max()) if "blend_profile_count" in predictions.columns else row.get("profile_count", 0)
-            row["prob_long_profile_std_mean"] = float(pd.to_numeric(predictions["prob_long_profile_std"], errors="coerce").mean())
-            row["prob_long_profile_std_p90"] = float(pd.to_numeric(predictions["prob_long_profile_std"], errors="coerce").quantile(0.90))
-        rows.append(row)
-    return pd.DataFrame(rows).reset_index(drop=True) if rows else pd.DataFrame()
-
-
-def _profile_blend_review_frame(
-    profile_blend: pd.DataFrame,
-    comparison: pd.DataFrame,
-    config: dict[str, Any],
-    control_profile: str,
-) -> pd.DataFrame:
-    if profile_blend.empty:
-        return profile_blend
-    reviewed = profile_blend.copy()
-    control_rows = comparison[
-        (comparison["profile"] == control_profile)
-        & (comparison["fold_scope"] == "full")
-    ]
-    if control_rows.empty:
-        reviewed["control_profile"] = control_profile
-        reviewed["reviewable"] = False
-        reviewed["review_reason"] = "missing_full_control"
-        return reviewed
-
-    control = control_rows.iloc[0].to_dict()
-    gates = _cfg(config, ["experiments", "profile_blend_review_gates"], {}) or {}
-    min_mean_delta = float(gates.get("min_mean_rank_ic_delta", 0.005))
-    max_std_delta = float(gates.get("max_std_rank_ic_delta", 0.0))
-    min_positive = float(gates.get("min_positive_ic_fraction", 0.70))
-    min_top_delta = float(gates.get("min_top_10_lift_global_delta", 0.02))
-    leader_gates = _cfg(config, ["experiments", "profile_blend_leader_gates"], {}) or {}
-    tail_lift_gates = leader_gates.get("tail_lift", gates) or gates
-    stability_gates = leader_gates.get("stability", {}) or {}
-    balanced_gates = leader_gates.get("balanced")
-
-    rows = []
-    for _, item in reviewed.iterrows():
-        row = item.to_dict()
-        row["control_profile"] = control_profile
-        row["mean_rank_ic_delta_vs_control"] = _float(row, "mean_rank_ic") - _float(control, "mean_rank_ic")
-        row["std_rank_ic_delta_vs_control"] = _float(row, "std_rank_ic") - _float(control, "std_rank_ic")
-        row["positive_ic_fraction_delta_vs_control"] = _float(row, "positive_ic_fraction") - _float(control, "positive_ic_fraction")
-        row["top_10_lift_global_delta_vs_control"] = _float(row, "top_10_lift_global") - _float(control, "top_10_lift_global")
-        row["selected_threshold_f1_delta_vs_control"] = _metric_or(
-            row,
-            "test_f1_at_official_threshold",
-            _metric_or(
-                row,
-                "test_f1_at_constrained_threshold",
-                _metric_or(row, "test_f1_at_selected_threshold", _float(row, "mean_long_f1")),
-            ),
-        ) - _metric_or(
-            control,
-            "test_f1_at_official_threshold",
-            _metric_or(
-                control,
-                "test_f1_at_constrained_threshold",
-                _metric_or(control, "test_f1_at_selected_threshold", _float(control, "mean_long_f1")),
-            ),
-        )
-        row["worst_5_rank_ic_delta_vs_control"] = _float(row, "worst_5_rank_ic_mean") - _float(control, "worst_5_rank_ic_mean")
-        reasons = []
-        if row["mean_rank_ic_delta_vs_control"] < min_mean_delta:
-            reasons.append("mean_rank_ic_delta")
-        if row["std_rank_ic_delta_vs_control"] > max_std_delta:
-            reasons.append("std_rank_ic_delta")
-        if _float(row, "positive_ic_fraction") < min_positive:
-            reasons.append("positive_ic_fraction")
-        if row["top_10_lift_global_delta_vs_control"] < min_top_delta:
-            reasons.append("top_10_lift_global_delta")
-        if not bool(row.get("mtf_leakage_passed", False)):
-            reasons.append("mtf_leakage")
-        if not bool(row.get("stationarity_policy_passed", False)):
-            reasons.append("stationarity_policy")
-        row["reviewable"] = not reasons
-        row["review_reason"] = ";".join(reasons)
-        tail_lift_reasons = _profile_blend_gate_reasons(row, tail_lift_gates)
-        stability_reasons = _profile_blend_gate_reasons(row, stability_gates)
-        balanced_reasons = _profile_blend_gate_reasons(row, balanced_gates or {})
-        row["tail_lift_eligible"] = not tail_lift_reasons
-        row["tail_lift_reason"] = ";".join(tail_lift_reasons)
-        row["stability_eligible"] = not stability_reasons
-        row["stability_reason"] = ";".join(stability_reasons)
-        row["balanced_eligible"] = bool(balanced_gates) and not balanced_reasons
-        row["balanced_reason"] = ";".join(balanced_reasons if balanced_gates else ["not_configured"])
-        rows.append(row)
-
-    if not rows:
-        return reviewed
-    frame = (
-        pd.DataFrame(rows)
-        .sort_values(
-            ["reviewable", "mean_rank_ic", "top_10_lift_global", "worst_5_rank_ic_mean"],
-            ascending=[False, False, False, False],
-        )
-        .reset_index(drop=True)
-    )
-    return _mark_profile_blend_leaders(frame)
-
-
-def _profile_blend_gate_reasons(row: dict[str, Any], gates: dict[str, Any]) -> list[str]:
-    reasons = []
-    if not gates:
-        return reasons
-    checks = [
-        ("min_mean_rank_ic_delta", "mean_rank_ic_delta_vs_control", "mean_rank_ic_delta", "min"),
-        ("max_std_rank_ic_delta", "std_rank_ic_delta_vs_control", "std_rank_ic_delta", "max"),
-        ("min_positive_ic_fraction", "positive_ic_fraction", "positive_ic_fraction", "min"),
-        ("min_top_10_lift_global", "top_10_lift_global", "top_10_lift_global", "min"),
-        ("min_top_10_lift_global_delta", "top_10_lift_global_delta_vs_control", "top_10_lift_global_delta", "min"),
-        ("min_worst_5_rank_ic_delta", "worst_5_rank_ic_delta_vs_control", "worst_5_rank_ic_delta", "min"),
-    ]
-    for gate_key, metric_key, reason, direction in checks:
-        if gate_key not in gates:
-            continue
-        value = _float(row, metric_key)
-        gate = float(gates[gate_key])
-        if direction == "min" and value < gate:
-            reasons.append(reason)
-        if direction == "max" and value > gate:
-            reasons.append(reason)
-    if not bool(row.get("mtf_leakage_passed", False)):
-        reasons.append("mtf_leakage")
-    if not bool(row.get("stationarity_policy_passed", False)):
-        reasons.append("stationarity_policy")
-    return reasons
-
-
-def _select_profile_blend_leader(profile_blend: pd.DataFrame, role: str) -> dict[str, Any]:
-    if profile_blend.empty:
-        return {}
-    if role == "tail_lift":
-        eligible_column = "tail_lift_eligible"
-        sort_columns = ["top_10_lift_global", "mean_rank_ic", "worst_5_rank_ic_mean"]
-        ascending = [False, False, False]
-    elif role == "stability":
-        eligible_column = "stability_eligible"
-        sort_columns = ["mean_rank_ic", "worst_5_rank_ic_mean", "std_rank_ic", "positive_ic_fraction"]
-        ascending = [False, False, True, False]
-    elif role == "balanced":
-        eligible_column = "balanced_eligible"
-        sort_columns = [
-            "mean_rank_ic",
-            "std_rank_ic",
-            "positive_ic_fraction",
-            "top_10_lift_global",
-            "worst_5_rank_ic_mean",
-        ]
-        ascending = [False, True, False, False, False]
-    else:
-        raise ValueError(f"Unknown profile blend leader role: {role}")
-    if eligible_column not in profile_blend.columns:
-        return {}
-    candidates = profile_blend[profile_blend[eligible_column].astype(bool)].copy()
-    if candidates.empty:
-        return {}
-    candidates = candidates.sort_values(sort_columns, ascending=ascending)
-    return candidates.iloc[0].to_dict()
-
-
-def _profile_blend_leaders(profile_blend: pd.DataFrame) -> dict[str, Any]:
-    leaders = {
-        "balanced_leader": _select_profile_blend_leader(profile_blend, "balanced"),
-        "tail_lift_leader": _select_profile_blend_leader(profile_blend, "tail_lift"),
-        "stability_leader": _select_profile_blend_leader(profile_blend, "stability"),
-    }
-    return {key: value for key, value in leaders.items() if value}
-
-
-def _mark_profile_blend_leaders(profile_blend: pd.DataFrame) -> pd.DataFrame:
-    if profile_blend.empty:
-        return profile_blend
-    marked = profile_blend.copy()
-    marked["balanced_leader"] = False
-    marked["tail_lift_leader"] = False
-    marked["stability_leader"] = False
-    leaders = _profile_blend_leaders(marked)
-    for role, leader in leaders.items():
-        profile = str(leader.get("profile", ""))
-        if not profile:
-            continue
-        marked.loc[marked["profile"] == profile, role] = True
-    roles = []
-    for _, row in marked.iterrows():
-        item_roles = []
-        if bool(row.get("balanced_leader", False)):
-            item_roles.append("balanced")
-        if bool(row.get("tail_lift_leader", False)):
-            item_roles.append("tail_lift")
-        if bool(row.get("stability_leader", False)):
-            item_roles.append("stability")
-        roles.append(",".join(item_roles))
-    marked["leader_roles"] = roles
-    return marked
-
-
-def _best_profile_blend(profile_blend: pd.DataFrame) -> dict[str, Any]:
-    leaders = _profile_blend_leaders(profile_blend)
-    return leaders.get("balanced_leader") or leaders.get("tail_lift_leader") or leaders.get("stability_leader") or {}
-
-
-def _profile_blend_markdown(profile_blend: pd.DataFrame) -> str:
-    lines = ["# Profile Blend Diagnostics", ""]
-    if profile_blend.empty:
-        lines.append("No full-profile blends were produced.")
-        return "\n".join(lines)
-    display_cols = [
-        "profile",
-        "blend_method",
-        "blend_weights",
-        "profile_count",
-        "fold_count",
-        "mean_rank_ic",
-        "std_rank_ic",
-        "positive_ic_fraction",
-        "mean_rank_ic_delta_vs_control",
-        "std_rank_ic_delta_vs_control",
-        "positive_ic_fraction_delta_vs_control",
-        "top_10_lift_global",
-        "top_10_lift_global_delta_vs_control",
-        "test_f1_at_selected_threshold",
-        "test_f1_at_constrained_threshold",
-        "test_pred_long_rate_at_constrained_threshold",
-        "reviewable",
-        "review_reason",
-        "balanced_eligible",
-        "balanced_reason",
-        "tail_lift_eligible",
-        "tail_lift_reason",
-        "stability_eligible",
-        "stability_reason",
-        "leader_roles",
-        "prob_long_profile_std_mean",
-        "prob_long_profile_std_p90",
-        "blend_profiles",
-    ]
-    visible = profile_blend[[column for column in display_cols if column in profile_blend.columns]].copy()
-    lines.append("| " + " | ".join(visible.columns) + " |")
-    lines.append("| " + " | ".join(["---"] * len(visible.columns)) + " |")
-    for _, row in visible.iterrows():
-        lines.append("| " + " | ".join(str(row[column]) for column in visible.columns) + " |")
-    return "\n".join(lines)
-
-
-def _write_profile_blend_files(path: Path, profile_blend: pd.DataFrame) -> None:
-    path.mkdir(parents=True, exist_ok=True)
-    profile_blend.to_csv(path / "profile_blend.csv", index=False)
-    (path / "profile_blend.md").write_text(_profile_blend_markdown(profile_blend), encoding="utf-8")
-    _write_json(path / "profile_blend.json", {"rows": profile_blend.to_dict(orient="records")})
-
-
-def _write_profile_diagnostic_summaries(path: Path, entries: list[dict[str, Any]]) -> None:
-    path.mkdir(parents=True, exist_ok=True)
-
-    def tagged_frame(entry: dict[str, Any], key: str) -> pd.DataFrame:
-        frame = entry["diagnostics"].get(key)
-        if frame is None or frame.empty:
-            return pd.DataFrame()
-        out = frame.copy()
-        out.insert(0, "fold_scope", str(entry["fold_scope"]))
-        out.insert(0, "profile", str(entry["profile"]))
-        return out
-
-    for key, filename in [
-        ("fold_metrics", "profile_fold_metrics.csv"),
-        ("threshold_summary", "profile_threshold_summary.csv"),
-        ("calibrated_threshold_summary", "profile_calibrated_threshold_summary.csv"),
-        ("threshold_grid_summary", "profile_threshold_grid_summary.csv"),
-        ("score_band_summary", "profile_score_band_summary.csv"),
-        ("score_policy_grid", "profile_score_policy_grid.csv"),
-        ("score_policy_selection", "profile_score_policy_selection.csv"),
-        ("feature_groups", "profile_feature_groups.csv"),
-    ]:
-        frames = [tagged_frame(entry, key) for entry in entries]
-        frames = [frame for frame in frames if not frame.empty]
-        if frames:
-            pd.concat(frames, ignore_index=True).to_csv(path / filename, index=False)
-
-
-def _write_experiment_bundle(
-    *,
-    output_dir: Path,
-    run_id: str,
-    report_dir: Path,
-    zip_paths: list[str],
-) -> tuple[Path, Path]:
-    bundle_path = output_dir / f"phase1_experiment_bundle_{run_id}.zip"
-    latest_path = output_dir / "phase1_latest_experiment_bundle.zip"
-    summary_files = [
-        "profile_comparison.csv",
-        "profile_comparison.md",
-        "profile_delta_vs_control.csv",
-        "seed_audit.csv",
-        "seed_audit.md",
-        "seed_audit.json",
-        "seed_stability.csv",
-        "seed_stability.json",
-        "seed_ensemble.csv",
-        "seed_ensemble.md",
-        "seed_ensemble.json",
-        "profile_blend.csv",
-        "profile_blend.md",
-        "profile_blend.json",
-        "profile_fold_metrics.csv",
-        "profile_threshold_summary.csv",
-        "profile_calibrated_threshold_summary.csv",
-        "profile_threshold_grid_summary.csv",
-        "profile_score_band_summary.csv",
-        "profile_score_policy_grid.csv",
-        "profile_score_policy_selection.csv",
-        "profile_feature_groups.csv",
-        "experiment_selection.csv",
-        "experiment_selection.md",
-        "experiment_selection.json",
-        "missing_selected_profiles.csv",
-        "missing_selected_profiles.md",
-        "missing_selected_profiles.json",
-        "holdout_reservation.csv",
-        "holdout_reservation.md",
-        "holdout_reservation.json",
-        "holdout_boundary_audit.csv",
-        "holdout_boundary_audit.md",
-        "holdout_boundary_audit.json",
-        "holdout_evaluation.csv",
-        "holdout_evaluation.md",
-        "holdout_evaluation.json",
-        "holdout_score_band_summary.csv",
-        "holdout_threshold_summary.csv",
-        "holdout_policy_evaluation.csv",
-        "holdout_policy_consistency.csv",
-        "holdout_policy_consistency.md",
-        "holdout_policy_consistency.json",
-        "holdout_policy_decision.csv",
-        "holdout_policy_decision.md",
-        "holdout_policy_decision.json",
-        "frozen_policy_robustness.csv",
-        "frozen_policy_robustness.md",
-        "frozen_policy_robustness.json",
-        "frozen_policy_monitoring_plan.csv",
-        "frozen_policy_monitoring_plan.md",
-        "frozen_policy_monitoring_plan.json",
-        "experiment_policy_guard.csv",
-        "experiment_policy_guard.md",
-        "experiment_policy_guard.json",
-        "future_oos_candidate_plan.csv",
-        "future_oos_candidate_plan.md",
-        "future_oos_candidate_plan.json",
-        "phase1_blocker_action_plan.csv",
-        "phase1_blocker_action_plan.md",
-        "phase1_blocker_action_plan.json",
-        "performance_gap_analysis.csv",
-        "performance_gap_analysis.md",
-        "performance_gap_analysis.json",
-        "fold_stability_forensics.csv",
-        "fold_stability_forensics.md",
-        "fold_stability_forensics.json",
-        "fold_stability_summary.csv",
-        "fold_stability_summary.md",
-        "fold_stability_summary.json",
-        "score_separation_forensics.csv",
-        "bad_fold_signature.csv",
-        "bad_fold_signature.md",
-        "bad_fold_signature.json",
-        "feature_drift_forensics.csv",
-        "feature_family_drift_summary.csv",
-        "feature_drift_forensics.md",
-        "feature_drift_forensics.json",
-        "probability_quality_forensics.csv",
-        "probability_quality_summary.csv",
-        "probability_quality_forensics.md",
-        "probability_quality_forensics.json",
-        "score_distribution_shift.csv",
-        "score_distribution_shift_summary.csv",
-        "score_distribution_shift.md",
-        "score_distribution_shift.json",
-        "fold_reliability_gate.csv",
-        "fold_reliability_gate_summary.csv",
-        "fold_reliability_gate.md",
-        "fold_reliability_gate.json",
-        "regime_threshold_policy_by_fold.csv",
-        "regime_threshold_policy_summary.csv",
-        "regime_threshold_policy.md",
-        "regime_threshold_policy.json",
-        "regime_stability_forensics.csv",
-        "regime_stability_summary.csv",
-        "regime_stability.md",
-        "regime_stability.json",
-        "threshold_forensics.csv",
-        "threshold_forensics.md",
-        "threshold_forensics.json",
-        "threshold_policy_review.csv",
-        "threshold_policy_review.md",
-        "threshold_policy_review.json",
-        "threshold_transfer_review.csv",
-        "threshold_transfer_review.md",
-        "threshold_transfer_review.json",
-        "threshold_transfer_by_fold.csv",
-        "payoff_alignment.csv",
-        "payoff_alignment_summary.csv",
-        "payoff_alignment.md",
-        "payoff_alignment.json",
-        "payoff_policy_robustness.csv",
-        "payoff_policy_robustness_summary.csv",
-        "payoff_policy_robustness.md",
-        "payoff_policy_robustness.json",
-        "training_execution_summary.json",
-        "auto_review.md",
-        "auto_review.json",
-        "next_actions.json",
-        "phase2_readiness.md",
-        "phase2_readiness.json",
-        "phase1_transition_plan.md",
-        "phase1_transition_plan.json",
-        "decision_report.json",
-        "best_candidate.json",
-    ]
-    with zipfile.ZipFile(bundle_path, "w", compression=zipfile.ZIP_DEFLATED) as archive:
-        for filename in summary_files:
-            path = report_dir / filename
-            if path.exists():
-                archive.write(path, f"{run_id}/{filename}")
-        for item in zip_paths:
-            path = Path(item)
-            if path.exists():
-                archive.write(path, f"{run_id}/diagnostics/{path.name}")
-    shutil.copyfile(bundle_path, latest_path)
-    return bundle_path, latest_path
-
-
-def _write_experiment_slim_bundle(*, output_dir: Path, run_id: str, report_dir: Path) -> tuple[Path, Path]:
-    slim_path = output_dir / f"phase1_experiment_slim_bundle_{run_id}.zip"
-    latest_slim_path = output_dir / "phase1_latest_experiment_slim_bundle.zip"
-    with zipfile.ZipFile(slim_path, "w", compression=zipfile.ZIP_DEFLATED) as archive:
-        for path in sorted(report_dir.glob("*")):
-            if path.is_file() and path.suffix.lower() in {".csv", ".json", ".md"}:
-                archive.write(path, f"{run_id}/{path.name}")
-    shutil.copyfile(slim_path, latest_slim_path)
-    return slim_path, latest_slim_path
-
 
 def run_experiment_matrix(
     frame: pd.DataFrame,
@@ -9820,7 +6688,6 @@ def run_experiment_matrix(
         "decision": decision,
     }
 
-
 def _profile_dirs(run_dir: Path) -> list[Path]:
     paths = []
     for profile_dir in run_dir.iterdir():
@@ -9830,7 +6697,6 @@ def _profile_dirs(run_dir: Path) -> list[Path]:
             if (scope_dir / "training_manifest.json").exists() and (scope_dir / "predictions_all.parquet").exists():
                 paths.append(scope_dir)
     return sorted(paths)
-
 
 def write_experiment_diagnostics(
     *,
@@ -10291,3 +7157,4 @@ def write_experiment_diagnostics(
         "phase1_transition_plan_path": str(phase1_transition_plan_path),
         "phase1_transition_plan_md_path": str(phase1_transition_plan_md_path),
     }
+

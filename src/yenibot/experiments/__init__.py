@@ -3,36 +3,112 @@
 This package manages multi-profile experiment runs including triage,
 full walk-forward CV, seed auditing, holdout evaluation, profile
 blending, and automated report generation.
-
-The monolith ``_monolith.py`` module contains the full original
-implementation.  Public APIs are re-exported here so callers can use::
-
-    from yenibot.experiments import run_experiment_matrix, experiment_settings
-
-A future refactoring pass will decompose ``_monolith`` into focused
-sub-modules (runner, triage, blend, holdout, report_writer, memory).
 """
 
-from yenibot.experiments._monolith import (  # noqa: F401
+from yenibot.experiments.holdout import (
+    _attach_holdout_soft_pass,
+    _holdout_boundary_audit_frame,
+    _holdout_reservation_frame,
+    prepare_training_holdout_split,
+    _holdout_policy_action,
+)
+from yenibot.experiments.triage import (
+    _auto_full_profiles,
+    _fold_reliability_gate_frame,
+    _fold_reliability_gate_summary_frame,
+    _passes_full,
+    _passes_triage,
+)
+from yenibot.experiments.blend import (
+    _best_profile_blend,
+    _profile_blend_leaders,
+    _profile_blend_predictions,
+    _profile_blend_review_frame,
+)
+from yenibot.experiments.profile_resolver import (
+    profile_config,
+)
+from yenibot.experiments.runner import (
+    _experiment_selection_frame,
+    _experiment_policy_guard_frame,
+    _fold_stability_forensics_frame,
+    _fold_stability_summary_frame,
+    _frozen_policy_monitoring_plan_frame,
+    _frozen_policy_robustness_frame,
+    _future_oos_candidate_plan_frame,
+    _feature_drift_forensics_frame,
+    _feature_family_drift_summary_frame,
+    _performance_gap_reasons,
+    _missing_selected_profiles,
+    _preflight_experiment_profiles,
+    _probability_quality_forensics_frame,
+    _probability_quality_summary_frame,
+    _regime_stability_frames,
+    _regime_threshold_policy_frames,
+    _score_distribution_shift_frame,
+    _score_distribution_shift_summary_frame,
+    _bad_fold_signature_frame,
+    _score_separation_forensics_frame,
+    _threshold_forensics_frame,
+    _threshold_policy_review_frame,
+    _threshold_transfer_review_frames,
     experiment_root,
     experiment_settings,
     latest_experiment_run,
     new_run_id,
-    profile_config,
     profile_run_dir,
     resolve_experiment_run_id,
     run_experiment_matrix,
+    run_profile_experiment,
     write_experiment_diagnostics,
 )
 
 __all__ = [
+    "_attach_holdout_soft_pass",
+    "_auto_full_profiles",
+    "_best_profile_blend",
+    "_experiment_selection_frame",
+    "_experiment_policy_guard_frame",
+    "_fold_reliability_gate_frame",
+    "_fold_reliability_gate_summary_frame",
+    "_fold_stability_forensics_frame",
+    "_fold_stability_summary_frame",
+    "_frozen_policy_monitoring_plan_frame",
+    "_frozen_policy_robustness_frame",
+    "_future_oos_candidate_plan_frame",
+    "_feature_drift_forensics_frame",
+    "_feature_family_drift_summary_frame",
+    "_holdout_boundary_audit_frame",
+    "_holdout_reservation_frame",
+    "_holdout_policy_action",
+    "_performance_gap_reasons",
+    "_missing_selected_profiles",
+    "_preflight_experiment_profiles",
+    "_passes_full",
+    "_passes_triage",
+    "_profile_blend_leaders",
+    "_profile_blend_predictions",
+    "_profile_blend_review_frame",
+    "_probability_quality_forensics_frame",
+    "_probability_quality_summary_frame",
+    "_regime_stability_frames",
+    "_regime_threshold_policy_frames",
+    "_score_distribution_shift_frame",
+    "_score_distribution_shift_summary_frame",
+    "_bad_fold_signature_frame",
+    "_score_separation_forensics_frame",
+    "_threshold_forensics_frame",
+    "_threshold_policy_review_frame",
+    "_threshold_transfer_review_frames",
     "experiment_root",
     "experiment_settings",
     "latest_experiment_run",
     "new_run_id",
+    "prepare_training_holdout_split",
     "profile_config",
     "profile_run_dir",
     "resolve_experiment_run_id",
     "run_experiment_matrix",
+    "run_profile_experiment",
     "write_experiment_diagnostics",
 ]
