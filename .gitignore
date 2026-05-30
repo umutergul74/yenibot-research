@@ -1,0 +1,83 @@
+# ── Python ────────────────────────────────────────────────────────────
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+dist/
+build/
+*.egg
+
+# ── Virtual environments ─────────────────────────────────────────────
+.venv/
+venv/
+env/
+
+# ── IDE ──────────────────────────────────────────────────────────────
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# ── Testing ──────────────────────────────────────────────────────────
+.pytest_cache/
+.testtmp/
+.codex_tmp/
+.codex_pytest_run/
+.mypy_cache/
+.ruff_cache/
+htmlcov/
+coverage.xml
+.coverage
+
+# ── Jupyter ──────────────────────────────────────────────────────────
+.ipynb_checkpoints/
+
+# ── Data & Model Artifacts ───────────────────────────────────────────
+data/raw/
+data/processed/
+checkpoints/
+*.pt
+*.pkl
+*.parquet
+
+# ── Experiment Bundles ───────────────────────────────────────────────
+reports/
+phase1_diagnostics_*/
+phase1_diagnostics_*.zip
+phase1_experiment_bundle*.zip
+phase1_experiment_slim_bundle*.zip
+phase1_latest_experiment_bundle*.zip
+phase1_latest_experiment_slim_bundle*.zip
+
+# ── Generated Reports ───────────────────────────────────────────────
+calibration.csv
+calibrated_calibration.csv
+calibrated_test_predictions.parquet
+profile_comparison.csv
+profile_comparison.md
+fold_metrics.csv
+good_bad_feature_audit.csv
+permutation_importance.csv
+regime_metrics.csv
+summary.md
+test_predictions.parquet
+threshold_metrics.csv
+tsne_embeddings.parquet
+cycle_history.csv
+
+# ── Runtime State ────────────────────────────────────────────────────
+bot_state.json
+regime_online_stats.json
+*.json
+!pyproject.toml
+
+# ── Secrets ──────────────────────────────────────────────────────────
+.env
+.env.*
+
+# ── Docker ───────────────────────────────────────────────────────────
+.dockerignore
+
+# ── OS ───────────────────────────────────────────────────────────────
+.DS_Store
+Thumbs.db

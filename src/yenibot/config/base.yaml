@@ -1,0 +1,421 @@
+﻿project:
+  name: yeniBot
+  package: yenibot
+  phase: 1
+  random_seed: 42
+  deterministic: true
+
+paths:
+  drive_base: /content/drive/MyDrive/yeniBot
+  data_dir: /content/drive/MyDrive/yeniBot/data
+  checkpoint_dir: /content/drive/MyDrive/yeniBot/checkpoints
+  local_data_dir: data
+  local_checkpoint_dir: checkpoints
+
+binance:
+  base_url: https://fapi.binance.com
+  vision_base_url: https://s3-ap-northeast-1.amazonaws.com/data.binance.vision
+  data_source: auto
+  symbol: BTCUSDT
+  primary_interval: 1h
+  htf_interval: 4h
+  intrabar_intervals: [15m]
+  futures_metrics:
+    enabled: true
+    filename: btc_futures_metrics.parquet
+    request_sleep_seconds: 0.0
+  funding_rates:
+    enabled: true
+    filename: btc_funding_rates.parquet
+    request_sleep_seconds: 0.15
+  start_date: "2022-01-01"
+  end_date: null
+  limit: 1500
+  request_sleep_seconds: 0.15
+  max_gap_multiplier: 2
+  intrabar_max_gap_multiplier: 8
+  zero_volume_policy: drop
+
+features:
+  active_profile: baseline_plus_4h_bounded_whale_no_4h_tier1
+  exclude_columns: []
+  exclude_patterns: []
+
+labeling:
+  tp_multiplier: 2.0
+  sl_multiplier: 5.0
+  max_holding_bars: 10
+  atr_column: atr_14
+  min_long_forward_return: 0.003
+  max_not_long_forward_return: 0.001
+  min_long_pct: 0.20
+  max_long_pct: 0.50
+
+model:
+  seq_len: 64
+  tcn_channels: 64
+  tcn_kernel_size: 3
+  tcn_dilations: [1, 2, 4, 8, 16]
+  gru_hidden: 128
+  gru_layers: 2
+  dropout: 0.2
+  fusion_hidden: 128
+
+training:
+  early_stop_metric: rank_ic
+  rank_ic_smoothing_epochs: 5
+  batch_size: 256
+  epochs: 100
+  early_stop_patience: 15
+  optimizer:
+    lr: 0.001
+    weight_decay: 0.0001
+  scheduler:
+    T_0: 10
+    T_mult: 2
+  grad_clip: 1.0
+  loss:
+    focal_gamma: 2.0
+    focal_alpha: 0.6
+    rank_ic_weight: 0.2
+    label_margin_weight: 0.0
+    label_margin: 0.25
+
+walk_forward:
+  train_bars: 5040
+  val_bars: 1080
+  test_bars: 720
+  step_bars: 720
+  purge_bars: 24
+  embargo_bars: 6
+
+hmm:
+  n_states: 3
+  covariance_type: full
+  n_iter: 200
+  random_state: 42
+  gamma_floor: 0.02
+  state_weight_floor: 0.08
+  n_ratio_alarm: 15.0
+  suppress_convergence_warnings: true
+  features:
+    - log_return
+    - gk_vol_14
+    - adx_14
+    - true_cvd_zscore
+    - vwap_dist_atr
+
+validation:
+  target_rank_ic: 0.03
+  max_rank_ic_std: 0.03
+  min_positive_ic_fraction: 0.75
+  min_long_f1: 0.45
+  suspicious_rank_ic: 0.10
+  random_like_rank_ic: 0.01
+  bad_fold_ic_threshold: -0.08
+  calibration_bins: 10
+  calibration:
+    enabled: true
+    method: isotonic
+  threshold_checks:
+    max_pred_long_rate: 0.70
+    min_precision: 0.30
+  policy_selection:
+    threshold_caps: [0.30, 0.40, 0.50, 0.60, 0.70]
+    max_selection_rate: 0.70
+    min_precision: 0.30
+    min_lift_vs_base: 1.00
+    min_forward_return: 0.00
+    min_positive_lift_fold_rate: 0.55
+    min_positive_forward_return_fold_rate: 0.55
+  payoff_policy_robustness:
+    min_mean_label_lift_vs_base: 1.05
+    min_positive_label_lift_fold_rate: 0.60
+    min_mean_forward_return: 0.00
+    min_positive_forward_return_fold_rate: 0.60
+    min_mean_tb_return: 0.00
+    min_positive_tb_return_fold_rate: 0.55
+    min_payoff_alignment_fold_rate: 0.50
+    max_sl_rate_above_base_fold_rate: 0.70
+  fold_reliability_gates:
+    enabled: true
+    min_accepted_fraction: 0.50
+    min_accepted_folds: 12
+    min_positive_ic_fraction: 0.75
+    max_rank_ic_std: 0.06
+    min_official_f1_delta: 0.00
+    gates:
+      - name: val_rank_ic_positive
+        min_val_rank_ic: 0.00
+      - name: val_score_gap_positive
+        min_val_score_gap: 0.00
+      - name: val_rank_ic_and_score_gap_positive
+        min_val_rank_ic: 0.00
+        min_val_score_gap: 0.00
+      - name: val_rank_ic_score_gap_and_ks
+        min_val_rank_ic: 0.00
+        min_val_score_gap: 0.00
+        min_val_score_ks: 0.08
+  regime_threshold_policy:
+    enabled: true
+    min_regime_val_rows: 80
+    min_regime_test_rows: 40
+    min_regime_val_longs: 5
+    max_pred_long_rate: 0.70
+    min_precision: 0.30
+    min_f1_delta_vs_official: 0.01
+    min_policy_pass_fold_rate: 0.55
+    min_positive_forward_return_fold_rate: 0.55
+  score_lift_bins: 10
+  score_bands:
+    - {name: top_10, min_bin: 9, max_bin: 9}
+    - {name: top_20, min_bin: 8, max_bin: 9}
+    - {name: top_30, min_bin: 7, max_bin: 9}
+    - {name: upper_half, min_bin: 5, max_bin: 9}
+    - {name: mid_upper_40_90, min_bin: 4, max_bin: 8}
+  recent_folds: 5
+  permutation_importance_folds: 7
+  permutation_repeats: 1
+
+experiments:
+  mode: staged
+  run_id: null
+  control_profile: baseline_plus_4h_bounded_whale_no_4h_tier1_no_4h_pure_volatility_no_1h_pure_volatility
+  candidate_profiles: []
+  triage_fold_ids: [0, 2, 4, 8, 13, 16, 17, 20, 21, 22, 23, 29, 32, 35, 36, 38, 39, 40, 41]
+  full_cv_profiles: auto
+  always_full_profiles:
+    - baseline_plus_4h_bounded_whale_no_4h_tier1_no_4h_pure_volatility_no_1h_pure_volatility
+    - baseline_stable_score_margin_loss
+    - baseline_no_4h_tier1_4h_large_trade_pressure_long
+  max_auto_full_candidates: 2
+  resume_existing: true
+  force_retrain: false
+  profile_blends:
+    include_auto_equal_weight: true
+    include_auto_rank_mean: false
+    weighted:
+      - name: control_long_pressure_65_35
+        method: prob_weighted
+        profiles:
+          - baseline_plus_4h_bounded_whale_no_4h_tier1_no_4h_pure_volatility_no_1h_pure_volatility
+          - baseline_no_4h_tier1_4h_large_trade_pressure_long
+        weights: [0.65, 0.35]
+        description: "Slightly control-heavy version of the best current two-profile blend."
+  holdout:
+    enabled: true
+    holdout_bars: 4320
+    holdout_filename: holdout_1h.parquet
+    policy: "profile_selection_only_before_holdout; holdout is reserved for one-shot final validation"
+  policy_review:
+    enabled: true
+    frozen_candidate: blend_prob_mean_953a4ee825
+    policy_type: score_band
+    policy_name: top_10
+    status: failed_clean_holdout_review
+    threshold_deployment_allowed: false
+    note: "Clean holdout run 20260522_135424 invalidated this frozen top_10 score-band as an active review candidate: forward return was negative. Keep it as a benchmark only; do not deploy or promote from the same holdout."
+    future_oos_candidates:
+      - blend_control_long_pressure_65_35
+      - baseline_stable_score_margin_loss
+    future_oos_monitor:
+      enabled: true
+      anchor_run_id: "20260522_135424"
+      anchor_data_end: "2026-05-13 08:00:00+00:00"
+      min_new_bars: 720
+      preferred_new_bars: 2160
+      allow_holdout_roll_forward: false
+      policy: "Monitor the failed frozen top_10 policy only as a historical benchmark. Do not change profile, blend weights, score band, or threshold from this holdout; define any replacement before a future unseen window."
+    robustness:
+      enabled: true
+      min_rows: 720
+      min_selected_rows: 50
+      min_rank_ic: 0.0
+      min_lift_vs_base: 1.0
+      min_forward_return: 0.0
+      windows:
+        - {name: post_ftx_rebuild, start: "2022-11-15 00:00:00+00:00", end: "2023-06-30 23:00:00+00:00"}
+        - {name: pre_etf_recovery, start: "2023-07-01 00:00:00+00:00", end: "2024-01-10 23:00:00+00:00"}
+        - {name: etf_to_halving_cycle, start: "2024-01-11 00:00:00+00:00", end: "2024-08-31 23:00:00+00:00"}
+        - {name: late_2024_to_q1_2025, start: "2024-09-01 00:00:00+00:00", end: "2025-03-31 23:00:00+00:00"}
+        - {name: pre_holdout_recent, start: "2025-04-01 00:00:00+00:00", end: "2025-11-14 08:00:00+00:00"}
+  experiment_memory:
+    enabled: true
+    reject_retests: true
+    allow_retest_profiles: []
+    reference_notes:
+      baseline_plus_4h_bounded_whale_no_4h_tier1: "Legacy baseline kept for continuity; latest full run mean IC 0.0575, std 0.1012, positive folds 78.6%."
+      baseline_no_4h_tier1_4h_large_trade_pressure_long: "Tail-lift benchmark; latest clean holdout run 20260522_135424 was weak as a standalone profile: IC 0.0143, top-10 lift 0.9485, and negative top-10 forward return. Keep as a comparison source only."
+      baseline_plus_4h_bounded_whale_no_4h_tier1_no_4h_pure_volatility_no_1h_pure_volatility: "Best current single-profile stability branch; run 20260526_185416 mean IC 0.0734, std 0.0708, positive folds 86.1%, official F1 0.4313. Main blockers remain fold std, official F1, and future unseen OOS."
+      baseline_stable_score_margin_loss: "Pre-registered training-objective candidate after run 20260528_193824 showed bad-fold score-separation compression/reversal. Same feature set as control; only adds a small pairwise label-margin loss. Must be evaluated on CV and future OOS before any promotion."
+      baseline_control_plus_futures_context: "Broad futures-context profile from run 20260524_072602: holdout top-10 improved, but CV stability deteriorated. Split into narrower OI, positioning, and funding tracks instead of rerunning broad by default."
+      baseline_control_plus_futures_oi_change_context: "Run 20260526_185416: narrow OI context failed CV stability versus control; keep inactive unless future research has a new explicit reason."
+      baseline_control_plus_futures_positioning_context: "Run 20260526_185416: narrow positioning context failed CV stability versus control; keep inactive unless future research has a new explicit reason."
+      baseline_control_plus_futures_funding_context: "Run 20260526_185416: funding context did not clear positive-fold or stability gates; keep inactive unless future research has a new explicit reason."
+      baseline_stable_no_4h_taker_mean12: "Run 20260526_185416: removing only 4h_taker_imbalance_mean_12 reduced mean IC, worsened std, and cut top-10 lift; direct deletion is not the answer."
+      baseline_stable_no_4h_large_trade_ratio: "Run 20260526_185416: removing raw 4H large_trade_ratio improved official F1/top-10 lift but damaged mean IC, std, and worst folds; use only as a lesson for conditional context."
+      baseline_stable_no_4h_taker_mean12_no_4h_large_trade_ratio: "Run 20260526_185416: combined deletion nearly reached F1 but collapsed positive-fold coverage; direct ablation is rejected."
+      baseline_stable_plus_4h_taker_mean12_ltr_context: "Run 20260528_162902: conditional 4H taker_mean12 x large_trade_ratio context failed to improve control; mean IC 0.0329, positive folds 58.3%, top-10 lift below 1.0."
+      baseline_stable_plus_4h_taker_mean12_ltr_context_no_raw_ltr: "Run 20260528_162902: no-raw-LTR conditional context had weak CV stability despite holdout-looking improvement; mean IC 0.0423, std 0.0957, positive folds 63.9%."
+      baseline_stable_plus_4h_taker_mean12_ltr_context_stable_only: "Run 20260528_162902: stable-only conditional context remained below control; mean IC 0.0262, positive folds 63.9%, worst folds deteriorated."
+      baseline_stable_plus_15m_flow_efficiency_rank: "Bundle 20260513_182426: not promotable as a standalone profile; keep inactive until selected-profile completeness is validated."
+      blend_prob_mean_953a4ee825: "Retired frozen review selection from pre-holdout CV: control + long-pressure equal-probability blend. Clean holdout run 20260522_135424 failed the active top-10 policy because forward return was negative; keep only as a historical benchmark."
+      blend_control_long_pressure_65_35: "Control-heavy blend retained only for future out-of-sample comparison. Clean holdout run 20260522_135424 also had negative top-10 forward return, so it must not be promoted from the same holdout."
+      training_early_stop_stability_branch: "Do not blindly retry the May 21 training-stability branch. Commit 7b3fcac added val_loss early stopping, rolling Rank IC support, higher dropout, stronger weight decay, and longer validation windows; commit 88e3b57 restored baseline defaults after review. Keep default early_stop_metric=rank_ic unless a future pre-registered experiment isolates one training change at a time."
+    rejected_profiles:
+      baseline_control_plus_futures_context:
+        reason: "Run 20260524_072602 broad futures-context profile improved frozen holdout top-10 but failed CV stability; use narrower futures OI/positioning/funding tracks instead."
+      baseline_control_plus_futures_oi_change_context:
+        reason: "Run 20260526_185416: narrow OI context mean IC 0.0400, std 0.1195, positive folds 66.7%; too unstable versus the control."
+      baseline_control_plus_futures_positioning_context:
+        reason: "Run 20260526_185416: positioning context mean IC 0.0396, std 0.0888, positive folds 69.4%; did not improve the control."
+      baseline_control_plus_futures_funding_context:
+        reason: "Run 20260526_185416: funding context mean IC 0.0613, std 0.0868, positive folds 69.4%; weak stability despite some recent-fold strength."
+      baseline_stable_no_4h_taker_mean12:
+        reason: "Run 20260526_185416: removing only 4h_taker_imbalance_mean_12 lowered mean IC and worsened std/top-10 lift; direct deletion rejected."
+      baseline_stable_no_4h_large_trade_ratio:
+        reason: "Run 20260526_185416: raw 4H large_trade_ratio deletion improved F1/top-10 but damaged mean IC, std, and worst folds; use conditional context instead."
+      baseline_stable_no_4h_taker_mean12_no_4h_large_trade_ratio:
+        reason: "Run 20260526_185416: combined deletion improved F1 toward target but collapsed positive-fold coverage and increased negative-fold fraction."
+      baseline_stable_plus_4h_taker_mean12_ltr_context:
+        reason: "Run 20260528_162902: targeted conditional context failed CV gates; mean IC and positive-fold coverage collapsed versus control."
+      baseline_stable_plus_4h_taker_mean12_ltr_context_no_raw_ltr:
+        reason: "Run 20260528_162902: no-raw-LTR variant improved only holdout-looking diagnostics but damaged CV std, positive-fold rate, and worst folds."
+      baseline_stable_plus_4h_taker_mean12_ltr_context_stable_only:
+        reason: "Run 20260528_162902: stable-only context did not recover fold stability or official F1 versus the control."
+      baseline_plus_4h_bounded_whale_stable_structure:
+        reason: "Full stable-structure replacement reduced mean IC and increased instability versus the prior control."
+      baseline_plus_4h_bounded_whale_no_4h_tier1_plus_4h_stable_overlay:
+        reason: "Narrow stable overlay did not beat the control gates when raw pure volatility remained in place."
+      baseline_plus_4h_bounded_whale_no_4h_tier1_no_4h_pure_volatility_no_slow_4h_bounded_flow:
+        reason: "Latest triage showed weaker IC; removing slow bounded flow did not fix the remaining bad folds."
+      baseline_plus_4h_bounded_whale_no_4h_tier1_no_4h_pure_volatility_no_4h_bounded_flow:
+        reason: "Latest triage showed weaker IC; deleting the full 4H bounded-flow family removed useful context."
+      baseline_plus_4h_bounded_whale_no_4h_tier1_no_4h_pure_volatility_no_4h_volume_context:
+        reason: "Latest triage had unstable positive-fold coverage; 4H volume deletion alone was not the right stabilizer."
+      baseline_no_4h_tier1_4h_cvd_pressure_stable:
+        reason: "Earlier flow-stable candidate failed promotion gates; stable CVD pressure alone did not improve the control."
+      baseline_no_4h_tier1_flow_stable_combo:
+        reason: "Earlier CVD plus large-trade stable combo over-expanded flow overlays and failed promotion gates."
+      baseline_no_4h_tier1_pruned_whale:
+        reason: "Earlier pruned-whale run did not add predictive edge over the control."
+      baseline_no_4h_tier1_4h_large_trade_pressure_rank_only:
+        reason: "Rank-only pressure branch did not beat the long-pressure benchmark."
+      baseline_no_4h_tier1_4h_large_trade_pressure_zscore_only:
+        reason: "Z-score-only pressure branch did not beat the long-pressure benchmark."
+      baseline_no_4h_tier1_4h_large_trade_pressure_short:
+        reason: "Short-horizon pressure branch was less stable than the long-horizon pressure branch."
+      baseline_no_4h_tier1_4h_large_trade_pressure_long_no_4h_bounded_flow:
+        reason: "Latest run showed no improvement; removing 4H bounded-flow context hurt the pressure branch."
+      baseline_no_4h_tier1_4h_large_trade_pressure_long_bad_fold_guardrail_light:
+        reason: "Guardrail profile was too destructive and did not recover the bad-fold pattern."
+      baseline_no_4h_tier1_4h_large_trade_pressure_long_no_4h_1h_pure_volatility:
+        reason: "Bundle 20260510_124744 triage had top-10 lift below 1.0 and negative recent IC."
+      baseline_no_4h_tier1_4h_large_trade_pressure_long_no_4h_1h_pure_volatility_pressure_24_only:
+        reason: "Bundle 20260510_124744 triage had weak mean IC and unstable positive-fold coverage."
+      baseline_plus_4h_bounded_whale_no_4h_tier1_no_4h_1h_pure_volatility_plus_4h_stable_vol_overlay:
+        reason: "Bundle 20260510_124744 triage improved volatility stability but damaged top-10 lift below 1.0."
+      baseline_plus_4h_bounded_whale_no_4h_tier1_no_raw_pure_volatility_except_1h_atr:
+        reason: "Bundle 20260510_145746 raw-volatility re-add failed to beat the stability control; volatility should be context, not standalone signal."
+      baseline_plus_4h_bounded_whale_no_4h_tier1_no_raw_pure_volatility_except_1h_gk:
+        reason: "Bundle 20260510_145746 raw-volatility re-add failed to beat the stability control; top-10 lift fell below the control."
+      baseline_plus_4h_bounded_whale_no_4h_tier1_no_raw_pure_volatility_except_1h_realized:
+        reason: "Bundle 20260510_145746 raw-volatility re-add improved some folds but worsened instability versus the control."
+      baseline_plus_4h_bounded_whale_no_4h_tier1_no_raw_pure_volatility_except_4h_atr:
+        reason: "Bundle 20260510_145746 raw 4H ATR re-add weakened triage mean IC and fold stability."
+      baseline_plus_4h_bounded_whale_no_4h_tier1_no_raw_pure_volatility_except_4h_gk:
+        reason: "Bundle 20260510_145746 raw 4H GK volatility re-add weakened triage mean IC and fold stability."
+      baseline_plus_4h_bounded_whale_no_4h_tier1_no_raw_pure_volatility_except_4h_realized:
+        reason: "Bundle 20260510_145746 raw 4H realized-volatility re-add weakened triage mean IC and fold stability."
+      baseline_stable_plus_1h_flow_rv_interactions:
+        reason: "Bundle 20260510_172332: broad 1H realized-volatility flow interactions had near-zero mean IC and failed positive-fold stability gates."
+      baseline_stable_plus_1h_flow_gk_interactions:
+        reason: "Bundle 20260510_172332: broad 1H GK-volatility flow interactions produced negative triage mean IC and weak positive-fold coverage."
+      baseline_stable_plus_1h_flow_atr_interactions:
+        reason: "Bundle 20260510_172332: broad 1H ATR flow interactions did not clear IC or positive-fold gates despite acceptable top-decile lift."
+      baseline_stable_plus_4h_flow_rv_interactions:
+        reason: "Bundle 20260510_172332: broad 4H realized-volatility flow interactions reduced mean IC and top-decile lift versus the stability control."
+      baseline_stable_plus_4h_flow_gk_interactions:
+        reason: "Bundle 20260510_172332: broad 4H GK-volatility flow interactions were essentially random in triage and damaged lift."
+      baseline_stable_plus_4h_flow_atr_interactions:
+        reason: "Bundle 20260510_172332: broad 4H ATR flow interactions showed weak mean IC and failed top-decile/positive-lift gates."
+      baseline_stable_no_1h_cvd_rate:
+        reason: "Bundle 20260513_070515: simple 1H CVD-rate ablation reduced triage mean IC from 0.0610 to 0.0336 and damaged top-decile lift."
+      baseline_stable_no_slow_4h_bounded_flow:
+        reason: "Bundle 20260513_070515: removing slow 4H bounded-flow means reduced triage mean IC to 0.0290; slow 4H context remains useful."
+      baseline_stable_no_slow_4h_bounded_flow_no_1h_cvd_rate:
+        reason: "Bundle 20260513_070515: combined ablation reduced triage mean IC to 0.0301 and increased instability."
+      baseline_stable_no_4h_whale_zscores:
+        reason: "Bundle 20260513_070515: best simple ablation but still far below control triage IC and failed positive-fold gates."
+      baseline_stable_no_4h_volume_context:
+        reason: "Bundle 20260513_070515: removing aligned 4H volume context lowered triage IC and top-decile lift."
+      baseline_stable_no_1h_large_trade_ratio:
+        reason: "Bundle 20260513_070515: removing local large-trade ratio lowered triage IC and top-decile lift."
+      baseline_stable_plus_15m_late_order_flow:
+        reason: "Bundle 20260513_123606: late 15m raw taker-flow improved only 8/19 triage folds and failed IC, top-10 lift, and bad-fold gates."
+      baseline_stable_plus_15m_intrahour_pressure:
+        reason: "Bundle 20260513_123606: raw 15m CVD pressure/slope family had weak triage mean IC and bad-fold reversals."
+      baseline_stable_plus_15m_whale_burst:
+        reason: "Bundle 20260513_123606: 15m whale burst profile had weak positive-fold coverage and top-10 lift below 1.0."
+      baseline_stable_plus_15m_order_flow_full:
+        reason: "Bundle 20260513_123606: full 15m raw order-flow family carried useful tail hints but too much noise; replace with narrow absorption/price-impact candidates."
+      baseline_stable_plus_15m_absorption_rank:
+        reason: "Bundle 20260513_182426: 15m absorption ranks produced negative triage mean IC and top-10 lift below 1.0."
+      baseline_stable_plus_15m_late_reversal_tanh:
+        reason: "Bundle 20260513_182426: late reversal tanh overlay had weak triage mean IC and poor positive-fold coverage versus the stability control."
+      baseline_stable_plus_15m_absorption_efficiency_combo:
+        reason: "Bundle 20260513_182426: absorption plus efficiency combo had weak triage mean IC, top-10 lift below 1.0, and unstable fold deltas."
+  seed_audit:
+    enabled: true
+    profiles:
+      - baseline_plus_4h_bounded_whale_no_4h_tier1_no_4h_pure_volatility_no_1h_pure_volatility
+    seeds: [42, 43, 44]
+    fold_ids: [0, 13, 21, 29, 32, 35, 39, 41]
+  promotion_gates:
+    triage:
+      min_mean_rank_ic_delta: 0.005
+      max_std_rank_ic_delta: 0.005
+      min_top_10_lift_global: 1.05
+      min_top_10_positive_lift_fold_rate: 0.55
+      min_worst_5_rank_ic_delta: 0.0
+      max_negative_ic_fraction_delta: 0.0
+      min_top_10_bad_fold_lift_mean: 1.0
+    full:
+      min_mean_rank_ic_delta: 0.005
+      min_positive_ic_fraction_floor: 0.75
+      max_std_rank_ic_delta: 0.002
+      min_selected_threshold_f1: 0.45
+      min_selected_threshold_f1_delta: 0.0
+      min_long_f1_delta: null
+      min_top_10_lift_global_delta: 0.05
+      min_top_10_lift_global: 1.0
+      min_worst_5_rank_ic_delta: 0.0
+      max_negative_ic_fraction_delta: 0.0
+      min_top_10_bad_fold_lift_mean_delta: 0.0
+  profile_blend_review_gates:
+    min_mean_rank_ic_delta: 0.005
+    max_std_rank_ic_delta: 0.02
+    min_positive_ic_fraction: 0.70
+    min_top_10_lift_global: 1.0
+    min_top_10_lift_global_delta: 0.02
+  profile_blend_leader_gates:
+    balanced:
+      min_mean_rank_ic_delta: 0.005
+      max_std_rank_ic_delta: 0.005
+      min_positive_ic_fraction: 0.75
+      min_top_10_lift_global: 1.0
+      min_top_10_lift_global_delta: 0.015
+      min_worst_5_rank_ic_delta: 0.0
+    tail_lift:
+      min_mean_rank_ic_delta: 0.005
+      max_std_rank_ic_delta: 0.02
+      min_positive_ic_fraction: 0.70
+      min_top_10_lift_global: 1.0
+      min_top_10_lift_global_delta: 0.02
+    stability:
+      min_mean_rank_ic_delta: 0.005
+      max_std_rank_ic_delta: 0.0
+      min_positive_ic_fraction: 0.70
+      min_top_10_lift_global: 1.0
+      min_worst_5_rank_ic_delta: 0.02
+
