@@ -1809,6 +1809,8 @@ experiments:
     future_oos_candidates:
       - blend_control_long_pressure_65_35
       - baseline_stable_score_margin_loss
+      - baseline_champion_ablate_noisy_flow_margin_loss
+      - baseline_champion_ablate_all_slow_flow_margin_loss
     future_oos_monitor:
       enabled: true
       anchor_run_id: "20260522_135424"
