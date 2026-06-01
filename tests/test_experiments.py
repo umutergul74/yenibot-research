@@ -1554,7 +1554,10 @@ def test_repo_experiment_profiles_keep_default_baseline_and_candidate_boundaries
     assert config["experiments"]["always_full_profiles"] == [
         "baseline_plus_4h_bounded_whale_no_4h_tier1_no_4h_pure_volatility_no_1h_pure_volatility",
         "baseline_stable_score_margin_loss",
-        "baseline_no_4h_tier1_4h_large_trade_pressure_long",
+        "baseline_champion_ablate_noisy_flow_margin_loss",
+        "baseline_champion_ablate_all_slow_flow_margin_loss",
+        "baseline_stable_plus_15m_absorption_efficiency_combo",
+        "baseline_champion_stable_15m_absorption_margin_loss",
     ]
     assert config["experiments"]["max_auto_full_candidates"] == 2
     assert config["experiments"]["candidate_profiles"] == []
@@ -1573,6 +1576,10 @@ def test_repo_experiment_profiles_keep_default_baseline_and_candidate_boundaries
     assert config["experiments"]["policy_review"]["future_oos_candidates"] == [
         "blend_control_long_pressure_65_35",
         "baseline_stable_score_margin_loss",
+        "baseline_champion_ablate_noisy_flow_margin_loss",
+        "baseline_champion_ablate_all_slow_flow_margin_loss",
+        "baseline_stable_plus_15m_absorption_efficiency_combo",
+        "baseline_champion_stable_15m_absorption_margin_loss",
     ]
     assert config["experiments"]["policy_review"]["future_oos_monitor"]["enabled"] is True
     assert config["experiments"]["policy_review"]["future_oos_monitor"]["anchor_run_id"] == "20260522_135424"
