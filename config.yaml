@@ -510,6 +510,27 @@ features:
       inherit: baseline_stable_no_slow_4h_bounded_flow
       append_exclude_patterns:
         - "cvd_cumulative_rate_norm"
+    baseline_champion_ablate_noisy_flow_margin_loss:
+      description: "Champion stability profile with top bad-fold suspect 4H taker-imbalance mean 12 ablated, combined with a pairwise label-margin loss weight of 0.05 and margin of 0.25 to boost score separation and F1."
+      inherit: baseline_plus_4h_bounded_whale_no_4h_tier1_no_4h_pure_volatility_no_1h_pure_volatility
+      append_exclude_patterns:
+        - "4h_taker_imbalance_mean_12"
+      config_overrides:
+        training:
+          loss:
+            label_margin_weight: 0.05
+            label_margin: 0.25
+    baseline_champion_ablate_all_slow_flow_margin_loss:
+      description: "Champion stability profile with both slow 4H flow means (12 and 24) ablated, combined with pairwise label-margin loss weight of 0.05 and margin of 0.25."
+      inherit: baseline_plus_4h_bounded_whale_no_4h_tier1_no_4h_pure_volatility_no_1h_pure_volatility
+      append_exclude_patterns:
+        - "4h_taker_imbalance_mean_12"
+        - "4h_taker_imbalance_mean_24"
+      config_overrides:
+        training:
+          loss:
+            label_margin_weight: 0.05
+            label_margin: 0.25
     baseline_stable_no_4h_whale_zscores:
       description: Stability control without smoother 4H whale z-score magnitudes, retaining sparse whale flags and large-trade ratio.
       inherit: baseline_plus_4h_bounded_whale_no_4h_tier1_no_4h_pure_volatility_no_1h_pure_volatility
@@ -1756,7 +1777,8 @@ experiments:
   always_full_profiles:
     - baseline_plus_4h_bounded_whale_no_4h_tier1_no_4h_pure_volatility_no_1h_pure_volatility
     - baseline_stable_score_margin_loss
-    - baseline_no_4h_tier1_4h_large_trade_pressure_long
+    - baseline_champion_ablate_noisy_flow_margin_loss
+    - baseline_champion_ablate_all_slow_flow_margin_loss
   max_auto_full_candidates: 2
   resume_existing: true
   force_retrain: false
