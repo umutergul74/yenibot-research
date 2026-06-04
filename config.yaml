@@ -539,6 +539,36 @@ features:
           loss:
             label_margin_weight: 0.05
             label_margin: 0.25
+    baseline_champion_ablate_noisy_flow_and_ratio_margin_loss:
+      description: "Champion profile with both 4H taker-mean12 and raw 4H large-trade ratio ablated, combined with margin loss to stabilize bad-fold signal shifts."
+      inherit: baseline_champion_ablate_noisy_flow_margin_loss
+      append_exclude_patterns:
+        - "4h_large_trade_ratio"
+        - "*_stable_rank"
+        - "*_stable_tanh"
+
+    baseline_champion_ablate_noisy_flow_margin_loss_val_loss_stop:
+      description: "Champion margin loss profile with early stopping metric changed to val_loss to stabilize cross-validation fold variance."
+      inherit: baseline_champion_ablate_noisy_flow_margin_loss
+      append_exclude_patterns:
+        - "*_stable_rank"
+        - "*_stable_tanh"
+      config_overrides:
+        training:
+          early_stop_metric: val_loss
+
+    baseline_champion_ablate_noisy_flow_margin_loss_regularized:
+      description: "Champion margin loss profile with increased regularization (dropout 0.4, weight decay 0.001) to reduce fold variance."
+      inherit: baseline_champion_ablate_noisy_flow_margin_loss
+      append_exclude_patterns:
+        - "*_stable_rank"
+        - "*_stable_tanh"
+      config_overrides:
+        model:
+          dropout: 0.4
+        training:
+          optimizer:
+            weight_decay: 0.001
     baseline_stable_no_4h_whale_zscores:
       description: Stability control without smoother 4H whale z-score magnitudes, retaining sparse whale flags and large-trade ratio.
       inherit: baseline_plus_4h_bounded_whale_no_4h_tier1_no_4h_pure_volatility_no_1h_pure_volatility
@@ -1787,8 +1817,10 @@ experiments:
     - baseline_stable_score_margin_loss
     - baseline_champion_ablate_noisy_flow_margin_loss
     - baseline_champion_ablate_all_slow_flow_margin_loss
-    - baseline_stable_plus_15m_absorption_efficiency_combo
     - baseline_champion_stable_15m_absorption_margin_loss
+    - baseline_champion_ablate_noisy_flow_and_ratio_margin_loss
+    - baseline_champion_ablate_noisy_flow_margin_loss_val_loss_stop
+    - baseline_champion_ablate_noisy_flow_margin_loss_regularized
   max_auto_full_candidates: 2
   resume_existing: true
   force_retrain: false
@@ -1821,8 +1853,10 @@ experiments:
       - baseline_stable_score_margin_loss
       - baseline_champion_ablate_noisy_flow_margin_loss
       - baseline_champion_ablate_all_slow_flow_margin_loss
-      - baseline_stable_plus_15m_absorption_efficiency_combo
       - baseline_champion_stable_15m_absorption_margin_loss
+      - baseline_champion_ablate_noisy_flow_and_ratio_margin_loss
+      - baseline_champion_ablate_noisy_flow_margin_loss_val_loss_stop
+      - baseline_champion_ablate_noisy_flow_margin_loss_regularized
     future_oos_monitor:
       enabled: true
       anchor_run_id: "20260522_135424"
